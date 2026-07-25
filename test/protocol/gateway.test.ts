@@ -1,0 +1,9 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import { ProtocolGateway } from "../../src/protocol/gateway";
+
+const gateway = () => new ProtocolGateway({ webviewInstanceId: "panel-1", bootstrapNonce: "nonce-1", workspaceId: "workspace-1", snapshot: () => ({ snapshotId: "snapshot-1", workspaceId: "workspace-1", streamId: "stream-1", throughSequence: 0, generatedAt: "2026-07-25T00:00:00.000Z", chats: { sessions: [], turns: [], attempts: [] } }) });
+const hello = { kind: "protocol.hello", webviewInstanceId: "panel-1", webviewRelease: "0.1.0", supportedProtocolVersions: [1], bootstrapNonce: "nonce-1" };
+
+test("binds exactly its own panel and returns its authoritative snapshot", () => { const result = gateway().hello(hello); assert.equal(result.kind, "protocol.welcome"); });
+test("rejects unbound and conflicting request identities without dispatch", () => { const subject = gateway(); const request = { protocolVersion: 1, kind: "query", name: "workbench.snapshot.get", requestId: "r1", webviewInstanceId: "panel-1", correlationId: "c1", causationId: null, operation: { operationId: "o1", intentId: "i1", submittedAt: "2026-07-25T00:00:00.000Z" }, expectedVersions: [], payload: {} }; const unbound = subject.validateRequest(request); assert.ok("code" in unbound); if ("code" in unbound) assert.equal(unbound.code, "webview-unbound"); subject.hello(hello); subject.validateRequest(request); const conflict = subject.validateRequest({ ...request, payload: { x: 1 } }); assert.ok("code" in conflict); if ("code" in conflict) assert.equal(conflict.code, "request-identity-conflict"); });
