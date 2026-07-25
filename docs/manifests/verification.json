@@ -1,0 +1,268 @@
+{
+  "schemaVersion": 1,
+  "canonicalSpec": "../MVP-SPEC.md",
+  "specRevision": "mvp-spec/2",
+  "supportedTargets": ["win32-x64", "darwin-arm64"],
+  "profiles": ["unit", "contract", "integration", "headless-scenario", "webview", "developer-vscode", "packaged-vscode"],
+  "checkDefaults": {
+    "mandatory": true,
+    "failureBehavior": "fail the applicable gate; no waiver, skip, quarantine, flaky-only pass, or unsupported not-applicable result",
+    "cleanup": "release handles and locks; retain only bounded sanitized evidence",
+    "evidence": ["machine-readable outcome", "duration", "fixture identity", "sanitized bounded artifacts and checksums"]
+  },
+  "checks": [
+    {
+      "id":"VC-ARCH-001","layer":"contract","profiles":["contract","headless-scenario"],"targets":["all"],
+      "requirements":["NR-ARC-001","NR-ARC-002","NR-ARC-003","NR-ARC-004","NR-ARC-005","NR-ARC-006","NR-ARC-007"],
+      "threatCases":[],"setup":"host/application fakes plus headless harness","fixtures":["FX-WORKSPACE"],
+      "stimulus":"exercise every version-1 handshake, control, query, command, event, payload bound, replay, collision, stale, gap, reload, and mismatch path through fake and production adapters",
+      "oracle":"the exact WF-020 catalog and generated schemas agree byte-for-byte across adapters; accepted commands produce equivalent authoritative transitions; invalid traffic has no side effect; snapshot-plus-events reconstruction matches host state",
+      "prohibitedOutcomes":["Webview-owned authority","cross-feature internal import","unvalidated state change"]
+    },
+    {
+      "id":"VC-RES-001","layer":"integration","profiles":["integration","headless-scenario","packaged-vscode"],"targets":["win32-x64","darwin-arm64"],
+      "requirements":["NR-RES-001","NR-RES-002","NR-RES-003","NR-RES-004","NR-RES-005","NR-RES-006","NR-MOD-001","NR-MOD-002"],
+      "threatCases":[],"setup":"synthetic repository, resource corpus, MCP fixtures, deterministic model provider","fixtures":["FX-RESOURCES","FX-MCP","FX-MODEL"],
+      "stimulus":"discover valid, invalid, unavailable, changed, and conflicting resources; execute selection and snapshot boundaries",
+      "oracle":"validation, isolation, origin, precedence, effective model, and immutable snapshot match the specification",
+      "prohibitedOutcomes":["silent substitution","allowlist broadening","hot swap","unrelated resource loss"]
+    },
+    {
+      "id":"VC-ROUTE-001","layer":"invariant","profiles":["unit","headless-scenario"],"targets":["all"],
+      "requirements":["NR-ROUTE-001","NR-ROUTE-002","NR-ROUTE-003","NR-ROUTE-004","NR-ROUTE-005"],
+      "threatCases":[],"setup":"eligible/ineligible Agent matrices and deterministic Orchestrator fixture","fixtures":["FX-ROUTING"],
+      "stimulus":"select across zero, one, tied, overridden, declined, and twice-declined candidates",
+      "oracle":"hard eligibility, rationale, tie-break, proposal, mismatch cycle, one reroute, and append-only attempts are exact",
+      "prohibitedOutcomes":["ineligible selection","unapproved file write","reroute loop","lost decline"]
+    },
+    {
+      "id":"VC-TASK-001","layer":"invariant","profiles":["unit","integration","headless-scenario"],"targets":["all"],
+      "requirements":["NR-TASK-001","NR-TASK-002","NR-TASK-003","NR-TASK-004","NR-TASK-005","NR-TASK-006","NR-TASK-012"],
+      "threatCases":[],"setup":"model-based Task scheduler with generated contracts, dependencies, graphs, and locks","fixtures":["FX-TASK-GRAPH"],
+      "stimulus":"generate every valid and invalid WF-019 Task, Subtask, Assignment, lease, operation, compatibility, and migration transition plus admissions, graph revisions, dependencies, and concurrent schedules",
+      "oracle":"every canonical transition emits its exact event and atomic effects; every guard and terminal prohibition rejects without side effects; contract, DAG, readiness, one slot, concurrency three, and one-writer invariants always hold",
+      "prohibitedOutcomes":["cycle","unconfirmed scope","two slot owners","two writers","blocked Task execution"]
+    },
+    {
+      "id":"VC-TASK-002","layer":"recovery","profiles":["integration","headless-scenario","packaged-vscode"],"targets":["win32-x64","darwin-arm64"],
+      "requirements":["NR-TASK-007","NR-TASK-008","NR-TASK-009","NR-TASK-010","NR-TASK-011"],
+      "threatCases":[],"setup":"real temporary SQLite, synthetic Git repository, deterministic crash controller","fixtures":["FX-TASK-RECOVERY"],
+      "stimulus":"pause, cancel, force-stop, restart, drift, reconcile, retry, repair, and complete",
+      "oracle":"known checkpoint recovery, drift classification, no blind replay, bounded repair, and contract-based completion",
+      "prohibitedOutcomes":["stale lock","silent duplicate","automatic rollback","completion with unresolved outcome"]
+    },
+    {
+      "id":"VC-CHAT-001","layer":"integration","profiles":["integration","headless-scenario","packaged-vscode"],"targets":["win32-x64","darwin-arm64"],
+      "requirements":["NR-CHAT-001","NR-CHAT-002","NR-CHAT-003","NR-CHAT-004","NR-CHAT-005","NR-CHAT-006","NR-CHAT-007","NR-CHAT-008","NR-CHAT-009"],
+      "threatCases":[],"setup":"real temporary SQLite, synthetic conversation and Tool fixtures","fixtures":["FX-CHAT"],
+      "stimulus":"exercise every WF-019 Response Attempt transition and guard; create, send, stream, approve, block, fail, cancel, retry, interrupt, summarize, correct ledger, fork, trash, delete, and contend with Task lock",
+      "oracle":"exact Response state/event/capacity behavior, no resumed or outcome-unknown Response, fixed Agent, immutable attempts/history, visible provenance, non-cascade, correct context, and invocation-time lock behavior",
+      "prohibitedOutcomes":["prompt duplication","automatic Tool replay","history rewrite","queued post-lock mutation"]
+    },
+    {
+      "id":"VC-AUTH-001","layer":"security","profiles":["unit","integration","headless-scenario","packaged-vscode"],"targets":["win32-x64","darwin-arm64"],
+      "requirements":["NR-AUTH-001","NR-AUTH-002","NR-AUTH-003","NR-AUTH-004","NR-AUTH-005","NR-AUTH-006","NR-AUTH-007"],
+      "threatCases":["TC-BOUNDARY","TC-AUTHORITY","TC-SECRETS","TC-RESOURCE-SUBSTITUTION"],
+      "setup":"path attack corpus, authority matrix, fake tools/providers, synthetic secrets and Git repository","fixtures":["FX-SECURITY"],
+      "stimulus":"attempt traversal, link escape, authority bypass, forbidden Git, secret capture, resource substitution, and uncertain retry",
+      "oracle":"every attempt is denied or safely executed within exact authority and produces sanitized append-only audit",
+      "prohibitedOutcomes":["boundary escape","authority broadening","secret disclosure","blind retry","audit rewrite"]
+    },
+    {
+      "id":"VC-MEM-001","layer":"integration","profiles":["unit","integration","headless-scenario"],"targets":["all"],
+      "requirements":["NR-MEM-001","NR-MEM-002","NR-MEM-003","NR-MEM-004","NR-MEM-005","NR-MEM-006","NR-MEM-007","NR-MEM-008"],
+      "threatCases":["TC-MEMORY-INJECTION"],"setup":"synthetic tracked/untracked Memory corpus and provenance store","fixtures":["FX-MEMORY"],
+      "stimulus":"discover, promote, drift, conflict, retrieve, consolidate, hit capacity, interrupt commit, and reconcile",
+      "oracle":"schema/privacy, exact confirmation, provenance, conflict exclusion, ranking, capacity, lock, and recovery rules hold",
+      "prohibitedOutcomes":["automatic promotion","tracked Personal Memory","cross-scope merge","unconfirmed write","blind replay"]
+    },
+    {
+      "id":"VC-UI-001","layer":"accessibility","profiles":["headless-scenario","webview","packaged-vscode"],"targets":["win32-x64","darwin-arm64"],
+      "requirements":["NR-UI-001","NR-UI-002","NR-UI-003","NR-UI-004","NR-UI-005","NR-UI-006"],
+      "threatCases":[],"setup":"all major Webview states in production CSP plus platform accessibility tooling","fixtures":["FX-WEBVIEW"],
+      "stimulus":"complete core flows keyboard-only; exercise focus, announcements, themes, zoom, motion, confirmations, badges, and notices",
+      "oracle":"WCAG 2.2 AA; automated scans clean; keyboard passes both targets; Narrator Windows and VoiceOver macOS attestations pass",
+      "prohibitedOutcomes":["focus trap","focus theft","duplicate announcement","color-only state","notification replay"]
+    },
+    {
+      "id":"VC-DB-001","layer":"contract","profiles":["contract","integration","headless-scenario","packaged-vscode"],"targets":["win32-x64","darwin-arm64"],
+      "requirements":["NR-DB-001","NR-DB-002","NR-DB-003","NR-DB-004","NR-DB-005","NR-DB-006","NR-DB-007","NR-DB-008","NR-DB-009"],
+      "threatCases":["TC-SQLITE"],"setup":"real temporary databases for every released schema and corruption/interruption fixtures","fixtures":["FX-DATABASE"],
+      "stimulus":"generate and introspect schema v1; exercise all 60 command transaction classes, typed artifact references and cleanup, append-only guards, commit/rollback, direct migration, interruption, corruption, restore, reopen, and older code against newer schema",
+      "oracle":"all 59 tables, columns, constraints, triggers, 26 indexes, artifact-reference union, command coverage, authority separation, atomic event pairing, intent/result ordering, backup, integrity, refusal, and explicit recovery match the WF-021 machine contract",
+      "prohibitedOutcomes":["schema drift","unclassified command","content or secret in SQLite","orphan reference deletion","history loss","partial migration commit","automatic replacement","newer-schema write"]
+    },
+    {
+      "id":"VC-DIAG-001","layer":"security","profiles":["unit","integration","packaged-vscode"],"targets":["win32-x64","darwin-arm64"],
+      "requirements":["NR-DIAG-001","NR-DIAG-002","NR-DIAG-003","NR-DIAG-004","NR-DIAG-005","NR-DIAG-006"],
+      "threatCases":["TC-DIAGNOSTIC-LEAK","TC-AUDIT-TAMPER"],"setup":"synthetic incidents with secrets, paths, identities, large evidence, and retention ages","fixtures":["FX-DIAGNOSTICS"],
+      "stimulus":"derive health, persist incidents, project activity/output, expire evidence, create previewed bundles, and invoke recovery links",
+      "oracle":"metadata-only evidence, correct causal chain/retention, sanitized bundle, and read-only diagnostic boundary",
+      "prohibitedOutcomes":["secret or identity leak","authoritative deletion","diagnostic mutation","automatic upload"]
+    },
+    {
+      "id":"VC-PKG-001","layer":"supply-chain","profiles":["packaged-vscode"],"targets":["win32-x64","darwin-arm64"],
+      "requirements":["NR-PKG-001","NR-PKG-002","NR-PKG-003","NR-PKG-004"],
+      "threatCases":["TC-PACKAGE"],"setup":"two VSIXs built from one tagged revision and clean target runners","fixtures":["FX-PACKAGES"],
+      "stimulus":"inspect, hash, scan, install, activate, restore, run packaged matrix, upgrade, downgrade, uninstall, and reinstall",
+      "oracle":"exact allowlist, same version/source, clean scans/SBOM/licenses, both target matrices pass, and publication is atomic",
+      "prohibitedOutcomes":["development file","secret","source artifact","partial release","known exploitable high/critical shipped vulnerability"]
+    },
+    {
+      "id":"VC-TRACE-001","layer":"specification","profiles":["unit"],"targets":["all"],
+      "requirements":["NR-VER-001","NR-VER-002","NR-VER-003","NR-VER-004","NR-VER-005","NR-VER-006"],
+      "threatCases":[],"setup":"canonical specification and companion manifests","fixtures":["FX-SPEC"],
+      "stimulus":"run the Specification Acceptance Gate validator and semantic checklist",
+      "oracle":"unique bidirectional complete traceability, all mandatory fields/coverage, zero unresolved items, and accountable acceptance record",
+      "prohibitedOutcomes":["orphan","placeholder","contradiction","unowned decision","false implementation-pass claim"]
+    }
+  ],
+  "acceptanceScenarios": [
+    {
+      "id":"AS-01","check":"VC-RES-001","requirements":["NR-RES-001","NR-RES-002","NR-RES-003","NR-RES-004","NR-RES-005","NR-MOD-001"],"fixtures":["FX-WORKSPACE","FX-RESOURCES","FX-MCP","FX-MODEL"],
+      "initialState":"clean synthetic repository containing independently valid, invalid, conflicting, unsupported, and unavailable resources",
+      "steps":["activate discovery","enumerate every catalog","select explicit and Auto models","start attempts across a resource edit boundary"],
+      "oracle":["each resource has the specified identity, origin, validity, availability, and diagnostic","one invalid resource does not disable unrelated resources except malformed top-level MCP JSON","each attempt retains its immutable Resource Snapshot and effective model"],
+      "prohibitedOutcomes":["silent resource substitution","explicit allowlist broadening","active-attempt hot swap"],"cleanup":"stop synthetic MCP servers and remove the temporary workspace","evidence":["catalog snapshot","diagnostic codes","Resource Snapshot hashes","effective-model records"]
+    },
+    {
+      "id":"AS-02","check":"VC-CHAT-001","requirements":["NR-CHAT-001","NR-CHAT-002","NR-CHAT-003","NR-CHAT-004","NR-CHAT-005","NR-CHAT-009"],"fixtures":["FX-WORKSPACE","FX-CHAT","FX-MODEL"],
+      "initialState":"empty workspace database and one valid Repository Agent",
+      "steps":["create a draft Session","submit first turn","complete and cancel separate attempts","restart the host","retry the cancelled turn","fork from an earlier point","trash and restore the origin","trash and permanently delete only the origin"],
+      "oracle":["first Send creates durable Session and turn before model work","attempts and effective resources remain immutable","restart marks unfinished work interrupted without auto-resume","fork survives origin deletion with deleted-origin marker"],
+      "prohibitedOutcomes":["duplicated user turn","automatic Tool replay","history rewrite","cascading fork deletion"],"cleanup":"close attempts and remove temporary database/artifacts","evidence":["Session/turn/attempt records","fork lineage","Trash transitions","deletion audit"]
+    },
+    {
+      "id":"AS-03","check":"VC-AUTH-001","requirements":["NR-CHAT-003","NR-AUTH-002","NR-AUTH-007","NR-TASK-009"],"fixtures":["FX-WORKSPACE","FX-CHAT","FX-SECURITY"],
+      "initialState":"Chat Session without Ambient Authority and a deterministic mutating Tool",
+      "steps":["request Tool","deny once","request and approve exact scope","interrupt after effect handoff","restart and reconcile applied, not-applied, and unknown variants"],
+      "oracle":["each request has a durable sanitized audit record","denial is side-effect-free","approved call stays within scope","retry occurs only after not-applied proof; unknown remains blocked"],
+      "prohibitedOutcomes":["authority broadening","blind mutation replay","audit overwrite","secret-bearing evidence"],"cleanup":"reconcile or explicitly leave fixture outcome blocked, then delete temporary workspace","evidence":["authority decision","Tool Audit Records","Operation Key","reconciliation appendices"]
+    },
+    {
+      "id":"AS-04","check":"VC-TASK-001","requirements":["NR-TASK-001","NR-TASK-002","NR-AUTH-002"],"fixtures":["FX-WORKSPACE","FX-TASK-GRAPH","FX-SECURITY"],
+      "initialState":"one running/queued expected-artifact fixture and one proposed Task draft",
+      "steps":["derive success criteria","compare expected artifacts","independently confirm one dependency and deny one non-dependency","review Repository Boundary and authority","confirm Task Contract"],
+      "oracle":["only named-artifact success dependency is proposed and stored","denial rationale persists","Task remains unqueued until the exact versioned contract and authority are confirmed"],
+      "prohibitedOutcomes":["dependency from shared files alone","implicit authority","unconfirmed queue admission"],"cleanup":"cancel admitted synthetic Task and release slot/lock","evidence":["contract versions","dependency proposals and decisions","authority record"]
+    },
+    {
+      "id":"AS-05","check":"VC-TASK-001","requirements":["NR-TASK-004","NR-TASK-005","NR-ROUTE-001","NR-TASK-011","NR-TASK-012"],"fixtures":["FX-WORKSPACE","FX-TASK-GRAPH","FX-ROUTING"],
+      "initialState":"confirmed Task with two independent read-only Subtasks, two write-capable Subtasks, and multiple eligible Agents",
+      "steps":["select Agents","run ready read-only work in parallel","serialize writers","append a valid graph revision","reject a cyclic revision","perform Completion Check and one repair revision"],
+      "oracle":["no more than three attempts and one writer run","selection rationale and attempts persist","only success unlocks dependents","completed work is immutable","completion follows Task Contract"],
+      "prohibitedOutcomes":["two writers","cycle commit","specialist work by unsuitable Orchestrator","completion before repair succeeds"],"cleanup":"finish Task and verify lock/slot release","evidence":["scheduler trace","graph revisions","Assignment Attempts","Completion Check results"]
+    },
+    {
+      "id":"AS-06","check":"VC-TASK-001","requirements":["NR-TASK-002","NR-TASK-003"],"fixtures":["FX-WORKSPACE","FX-TASK-GRAPH"],
+      "initialState":"three confirmed queued Tasks where the earliest is dependency-blocked and the later two are ready",
+      "steps":["run scheduler","complete later ready Task","fail prerequisite of first Task","remove or replace dependency by explicit user action","rerun scheduler"],
+      "oracle":["single Active Task Slot is always unique","scheduler skips blocked earlier Task and starts earliest ready Task","failed prerequisite never satisfies dependency","order never overrides readiness"],
+      "prohibitedOutcomes":["two active Tasks","blocked Task start","implicit dependency removal"],"cleanup":"cancel remaining synthetic Tasks and verify no slot owner","evidence":["queue order","readiness decisions","slot transitions","dependency history"]
+    },
+    {
+      "id":"AS-07","check":"VC-TASK-002","requirements":["NR-TASK-007","NR-TASK-008","NR-TASK-010"],"fixtures":["FX-WORKSPACE","FX-TASK-RECOVERY"],
+      "initialState":"running Task with committed checkpoint, baseline, and Repository Write Lock",
+      "steps":["request pause","quiesce and release lock","terminate Extension Host","modify repository with unrelated then conflicting drift variants","activate recovery","perform Repository Reactivation","resume safe variant"],
+      "oracle":["paused Task stays paused across restart","completed effects and checkpoint persist","unrelated drift refreshes context","conflict enters externally-blocked","safe resume reacquires lock only after revalidation"],
+      "prohibitedOutcomes":["automatic paused resume","stale lock","stale in-memory baseline","conflicting resume"],"cleanup":"cancel or complete recovered Task and remove fixture","evidence":["checkpoint","lock audit","baseline comparison","reactivation classification","recovery incident"]
+    },
+    {
+      "id":"AS-08","check":"VC-TASK-002","requirements":["NR-TASK-009","NR-DB-003","NR-DB-007","NR-DB-008","NR-DB-009","NR-VER-003"],"fixtures":["FX-WORKSPACE","FX-TASK-RECOVERY","FX-DATABASE"],
+      "initialState":"one deterministic fixture per registered Durability Boundary",
+      "steps":["inject termination immediately before and after each boundary","restart Runtime","run invariant checker","classify resumed, reconciled, blocked, or terminal result"],
+      "oracle":["every registered boundary is exercised","committed state survives and incomplete transactions roll back","effect handoff is reconciled","no stale lock or unresolved outcome advances"],
+      "prohibitedOutcomes":["silent duplicate","lost committed state","authority bypass","blind unknown retry"],"cleanup":"resolve fixture operations and delete each temporary database/repository","evidence":["boundary ID","injection side","database integrity","transition trace","reconciliation outcome"]
+    },
+    {
+      "id":"AS-09","check":"VC-CHAT-001","requirements":["NR-TASK-006","NR-CHAT-008"],"fixtures":["FX-WORKSPACE","FX-CHAT","FX-TASK-GRAPH"],
+      "initialState":"active Chat Session and Task ready to acquire Repository Write Lock",
+      "steps":["start Chat mutation","request Task lock","let mutation settle","acquire Task lock","send Chat read-only and mutation-seeking turns","release Task lock","request a new Chat mutation"],
+      "oracle":["Task waits for active mutation safe boundary","pending Chat approval does not delay lock","Chat conversation/read Tools continue under lock","write/opaque calls deny at invocation and are not queued","mutation returns after release"],
+      "prohibitedOutcomes":["forced cancellation of settling mutation","Chat write under lock","automatic delayed mutation"],"cleanup":"finish Chat attempt and Task; verify global writer idle","evidence":["lock timeline","Tool classifications","policy denials","post-release invocation"]
+    },
+    {
+      "id":"AS-10","check":"VC-TASK-002","requirements":["NR-TASK-007","NR-TASK-009","NR-MOD-002","NR-RES-005"],"fixtures":["FX-WORKSPACE","FX-TASK-RECOVERY","FX-MCP","FX-MODEL"],
+      "initialState":"recoverable Task fixture with switchable drift, authority, model, MCP, and operation conditions",
+      "steps":["induce each condition independently","activate recovery or next scheduling boundary","observe classification and Attention Request","restore the external condition","reactivate and continue when safe"],
+      "oracle":["each condition maps to specified blocked, routing, or failed state","no authority prompt interrupts Task execution","unknown operation requires reconciliation","restored conditions are revalidated before resume"],
+      "prohibitedOutcomes":["silent fallback","mid-Task authority broadening","automatic unknown retry","lost intervention"],"cleanup":"restore fixtures, resolve notices, and terminate Task","evidence":["stable blocker code","Task state","Attention Request","resource/authority revalidation"]
+    },
+    {
+      "id":"AS-11","check":"VC-MEM-001","requirements":["NR-MEM-003","NR-MEM-004","NR-MEM-005","NR-MEM-006","NR-MEM-007","NR-MEM-008"],"fixtures":["FX-WORKSPACE","FX-MEMORY"],
+      "initialState":"valid Project/Personal Memories plus stale, conflicting, capacity, tracked-personal, and interrupted-write variants",
+      "steps":["request promotion","preview exact proposal","reject then reconfirm exact version","retrieve","introduce cross-scope conflict","consolidate same-scope entries","interrupt file replacement and reconcile"],
+      "oracle":["rejection writes nothing","confirmation hash binds exact content/scope","tracked Personal Memory blocks","conflict excludes guidance","consolidation preserves provenance","recovery never blindly replays"],
+      "prohibitedOutcomes":["automatic promotion","cross-scope consolidation","silent conflict precedence","unconfirmed post-lock write"],"cleanup":"reconcile fixture and remove synthetic Memory files/provenance","evidence":["proposal/hash","diff","provenance versions","retrieval reasons","operation reconciliation"]
+    },
+    {
+      "id":"AS-12","check":"VC-UI-001","requirements":["NR-UI-002","NR-UI-004","NR-UI-005","NR-UI-006"],"fixtures":["FX-WEBVIEW","FX-TASK-GRAPH","FX-CHAT"],
+      "initialState":"every major Workbench state with deterministic Tasks, Chats, interventions, recovery, and diagnostics",
+      "steps":["complete every core flow keyboard-only","exercise composite navigation and focus restoration","emit duplicate and coalescible events","toggle zoom, contrast, and reduced motion","run automated semantics; run packaged Narrator and VoiceOver representative flows"],
+      "oracle":["WCAG 2.2 AA semantics and keyboard behavior pass","focus never moves from background work","announcements are polite and deduplicated","badge counts unresolved requests only","platform attestations pass"],
+      "prohibitedOutcomes":["focus trap","assertive or streaming announcement","color-only state","notification replay","focus-stealing background work"],"cleanup":"resolve Attention Requests and close Webview fixtures","evidence":["automated scan","keyboard trace","focus/announcement assertions","Narrator attestation","VoiceOver attestation"]
+    },
+    {
+      "id":"AS-13","check":"VC-DB-001","requirements":["NR-DB-004","NR-DB-005","NR-DB-006"],"fixtures":["FX-DATABASE","FX-PACKAGES"],
+      "initialState":"fresh, every prior schema, interrupted/corrupt migration, valid backup, and newer-schema database variants",
+      "steps":["activate each variant","create backup and migrate directly","inject interruption at each migration boundary","restart and integrity-check","explicitly restore backup","run older code against newer schema"],
+      "oracle":["writable services wait for compatibility","migration is transactional and direct","live database/backup survive failure","recovery is explicit","older code refuses every write"],
+      "prohibitedOutcomes":["partial migration","automatic live replacement","backup loss before verified reopen","newer-schema write"],"cleanup":"close connections and delete synthetic database/backup files","evidence":["schema/version records","backup checksum","integrity results","fault outcomes","write-refusal audit"]
+    },
+    {
+      "id":"AS-14","check":"VC-ARCH-001","requirements":["NR-ARC-002","NR-ARC-003"],"fixtures":["FX-WORKSPACE","FX-WEBVIEW"],
+      "initialState":"each authoritative Task, Chat, Agent, Memory, attention, diagnostics, migration, and recovery presentation state",
+      "steps":["open Workbench","capture rendered projection","destroy Webview at each state","create a new Webview instance","handshake and request authoritative reconstruction","send stale old-instance and duplicate messages"],
+      "oracle":["new projection equals host authoritative state","ephemeral view preferences may restore separately","old-instance, stale, duplicate, and mismatched inputs have deterministic side-effect-free outcomes"],
+      "prohibitedOutcomes":["Webview-domain recovery","lost authoritative state","old-instance mutation","duplicate side effect"],"cleanup":"dispose both Webview instances and temporary workspace","evidence":["snapshot/event sequence","projection comparison","rejection records","authoritative state hash"]
+    }
+  ],
+  "threatCases": [
+    {
+      "id":"TC-BOUNDARY","status":"complete","assets":["repository contents","Approved Linked Roots","Git worktree"],"trustBoundaries":["model-to-Runtime Tool request","repository link to canonical target"],"attackerCapabilities":["malicious prompt or Agent supplies crafted paths","repository content retargets or introduces links"],"abusePaths":["absolute, drive, UNC, device, parent traversal","symlink, junction, hard-link, move-destination escape"],"requiredControls":["canonical Repository Boundary validation on every source and destination","link target binding and retarget invalidation","no link creation"],"controlRequirements":["NR-AUTH-001"],"acceptedResidualRisk":"A separately authorized Ambient Tool may act outside the Repository Boundary with the local user's authority; the Authority Review discloses that it is not sandboxed.","negativeChecks":["VC-AUTH-001"]
+    },
+    {
+      "id":"TC-AUTHORITY","status":"complete","assets":["local user authority","repository and external services","Task Contract"],"trustBoundaries":["model-to-policy decision","Webview-to-host approval","resource-snapshot boundary"],"attackerCapabilities":["model asserts nonexistent permission","stale or forged approval is replayed","resource changes after approval"],"abusePaths":["scope broadening","mid-Task prompt","shell grant reuse","fingerprint substitution"],"requiredControls":["Runtime-owned grants","bounded scope and exact fingerprints","deny by default","no mid-Task authority expansion"],"controlRequirements":["NR-AUTH-002","NR-AUTH-003","NR-AUTH-004"],"acceptedResidualRisk":"A user may knowingly authorize broad Task external capability or arbitrary shell after the required disclosure; Bridgit cannot sandbox those effects.","negativeChecks":["VC-AUTH-001"]
+    },
+    {
+      "id":"TC-SECRETS","status":"complete","assets":["credentials","tokens","host identity","private content"],"trustBoundaries":["SecretStorage-to-adapter","Tool result-to-model/audit/diagnostics"],"attackerCapabilities":["prompt requests credentials","Tool or error returns secret-like content"],"abusePaths":["context injection","environment inheritance","audit/error/bundle exfiltration"],"requiredControls":["secret references only","minimal environments","prohibited credential-retrieval Tools","sanitization and fail-closed evidence"],"controlRequirements":["NR-AUTH-006"],"acceptedResidualRisk":"An authorized Ambient Tool may independently use credentials available to the local user; Bridgit neither retrieves nor guarantees containment of that external process.","negativeChecks":["VC-AUTH-001","VC-DIAG-001"]
+    },
+    {
+      "id":"TC-RESOURCE-SUBSTITUTION","status":"complete","assets":["Agent instructions","Tool schemas","MCP endpoints","Resource Snapshot"],"trustBoundaries":["repository resource discovery","extension registry","MCP configuration"],"attackerCapabilities":["change case-colliding identity","replace provider version/schema/configuration","edit resource during execution"],"abusePaths":["identity collision","allowlist broadening","hot swap","trusted-server retarget"],"requiredControls":["validation and protected identities","origin-preserving catalogs","fingerprint-bound trust","immutable Resource Snapshot"],"controlRequirements":["NR-RES-004","NR-RES-006"],"acceptedResidualRisk":"A user-authorized repository edit may intentionally change resources for the next snapshot; active attempts retain the prior validated version.","negativeChecks":["VC-RES-001","VC-AUTH-001"]
+    },
+    {
+      "id":"TC-MEMORY-INJECTION","status":"complete","assets":["Project and Personal Memory guidance","Memory provenance","Git privacy"],"trustBoundaries":["conversation-to-proposal","proposal-to-Runtime write","repository Memory import"],"attackerCapabilities":["untrusted content proposes durable guidance","tracked path exposes Personal Memory","stale source conflicts with current repository"],"abusePaths":["automatic promotion","confirmation drift","cross-scope overwrite","conflicted retrieval"],"requiredControls":["exact hash-bound confirmation","sole Runtime writer","privacy validation","provenance/staleness/conflict checks"],"controlRequirements":["NR-MEM-002","NR-MEM-003","NR-MEM-004","NR-MEM-005"],"acceptedResidualRisk":"The user may explicitly confirm incorrect but schema-valid guidance; provenance keeps that decision inspectable and later correction supersedes it.","negativeChecks":["VC-MEM-001"]
+    },
+    {
+      "id":"TC-SQLITE","status":"complete","assets":["authoritative operational history","checkpoints","migration backup"],"trustBoundaries":["application-to-SQLite adapter","old-code-to-new-schema","backup-to-live restore"],"attackerCapabilities":["crash during transaction or migration","supply corrupt database","run older extension code"],"abusePaths":["partial state/event commit","history loss","unsafe downgrade write","automatic corrupt replacement"],"requiredControls":["atomic transactions","integrity and compatibility gate","pre-upgrade backup","write refusal and explicit recovery"],"controlRequirements":["NR-DB-002","NR-DB-004","NR-DB-005","NR-DB-006"],"acceptedResidualRisk":"A local user or host failure can destroy both live database and backup; the MVP provides recovery checks, not tamper-proof or off-device storage.","negativeChecks":["VC-DB-001"]
+    },
+    {
+      "id":"TC-DIAGNOSTIC-LEAK","status":"complete","assets":["secrets","repository/conversation content","user, machine, path, endpoint identity"],"trustBoundaries":["runtime evidence-to-diagnostics","diagnostics-to-Support Bundle"],"attackerCapabilities":["cause secret-bearing failures","select content for export","craft identifiers that resemble safe metadata"],"abusePaths":["raw exception persistence","absolute path or identity leak","automatic content export"],"requiredControls":["metadata-first allowlist","fail-closed sanitization","bundle-local tokens","exact preview for content-bearing additions"],"controlRequirements":["NR-DIAG-001","NR-DIAG-003","NR-DIAG-005"],"acceptedResidualRisk":"A user can deliberately include previewed content in one local bundle; that explicit one-bundle choice is not reusable consent.","negativeChecks":["VC-DIAG-001"]
+    },
+    {
+      "id":"TC-AUDIT-TAMPER","status":"complete","assets":["Tool Audit Records","causal history","reconciliation evidence"],"trustBoundaries":["Runtime-to-authoritative store","authoritative store-to-projection"],"attackerCapabilities":["Agent attempts record rewrite","local actor alters storage","diagnostic action tries to mutate history"],"abusePaths":["outcome replacement","denial erasure","reconciliation overwrite","diagnostic retry/edit"],"requiredControls":["append-only attempts and corrections","transactional audit pairing","read-only diagnostics boundary","integrity checks"],"controlRequirements":["NR-AUTH-007","NR-DB-002","NR-DIAG-006"],"acceptedResidualRisk":"The MVP does not provide cryptographic tamper evidence against a local user with direct storage access; corruption is detected where integrity checks can observe it.","negativeChecks":["VC-AUTH-001","VC-DIAG-001"]
+    },
+    {
+      "id":"TC-PACKAGE","status":"complete","assets":["shipped extension code","native SQLite runtime","Webview assets","release identity"],"trustBoundaries":["source-to-build","build-to-VSIX","GitHub Release-to-installer"],"attackerCapabilities":["inject development file or secret","substitute target binary","ship vulnerable dependency","partially publish release"],"abusePaths":["package-content injection","checksum mismatch","CSP bypass asset","target divergence"],"requiredControls":["exact content allowlist","same-tag two-target build","SBOM/license/vulnerability/secret scans","SHA-256 and atomic publication"],"controlRequirements":["NR-PKG-001","NR-PKG-002","NR-PKG-004"],"acceptedResidualRisk":"Scanning cannot prove the absence of unknown vulnerabilities; known exploitable shipped high or critical findings block release.","negativeChecks":["VC-PKG-001"]
+    }
+  ],
+  "durabilityBoundaries": [
+    {"id":"DB-TASK-CONTRACT-COMMIT","status":"complete","point":"transaction committing a confirmed Task Contract before queue admission","expectedRecovery":"contract is wholly admitted or absent","faultCheck":"VC-TASK-002"},
+    {"id":"DB-TASK-GRAPH-REVISION-COMMIT","status":"complete","point":"transaction committing a Task Graph Revision and audit event","expectedRecovery":"revision and current graph agree, or neither changed","faultCheck":"VC-TASK-002"},
+    {"id":"DB-ASSIGNMENT-SELECTION-COMMIT","status":"complete","point":"transaction committing selected Agent, rationale, and Resource Snapshot before execution","expectedRecovery":"attempt is durably selected or nonexistent","faultCheck":"VC-TASK-002"},
+    {"id":"DB-CHAT-TURN-COMMIT","status":"complete","point":"transaction committing submitted user turn before model or Tool work","expectedRecovery":"one durable turn exists and unfinished attempt may retry without duplicating it","faultCheck":"VC-CHAT-001"},
+    {"id":"DB-OPERATION-INTENT-COMMIT","status":"complete","point":"transaction committing mutation intent and Operation Key before external handoff","expectedRecovery":"operation is known pending and must reconcile before retry","faultCheck":"VC-TASK-002"},
+    {"id":"DB-EXTERNAL-EFFECT-HANDOFF","status":"complete","point":"immediate boundary where a committed operation is handed to a repository, Tool, MCP, or external provider","expectedRecovery":"outcome is reconciled as applied, not applied, or unknown","faultCheck":"VC-TASK-002"},
+    {"id":"DB-OPERATION-OUTCOME-COMMIT","status":"complete","point":"transaction committing observed operation result and audit evidence","expectedRecovery":"committed outcome is authoritative and effect is not replayed","faultCheck":"VC-TASK-002"},
+    {"id":"DB-DURABLE-CHECKPOINT-COMMIT","status":"complete","point":"transaction committing continuation state after completed effects","expectedRecovery":"Runtime resumes only from the complete checkpoint","faultCheck":"VC-TASK-002"},
+    {"id":"DB-WRITE-LOCK-ACQUIRE-COMMIT","status":"complete","point":"transaction committing Repository Write Lock ownership before Task mutation","expectedRecovery":"at most one owner is visible; uncommitted acquisition owns nothing","faultCheck":"VC-TASK-002"},
+    {"id":"DB-WRITE-LOCK-RELEASE-COMMIT","status":"complete","point":"transaction committing lock release after quiescence or non-executing transition","expectedRecovery":"no stale owner remains after committed release; interrupted release is recovered before work","faultCheck":"VC-TASK-002"},
+    {"id":"DB-MEMORY-WRITE-INTENT-COMMIT","status":"complete","point":"transaction committing exact confirmed Memory proposal hash and Operation Key","expectedRecovery":"only the confirmed version may proceed and drift invalidates it","faultCheck":"VC-MEM-001"},
+    {"id":"DB-MEMORY-FILE-REPLACE-HANDOFF","status":"complete","point":"handoff applying recoverable exact Memory file replacement","expectedRecovery":"file is reconciled against intended postcondition before retry","faultCheck":"VC-MEM-001"},
+    {"id":"DB-MEMORY-PROVENANCE-COMMIT","status":"complete","point":"transaction pairing reconciled Memory version with private provenance and registry refresh","expectedRecovery":"file, provenance, and registry are reconciled or explicitly blocked","faultCheck":"VC-MEM-001"},
+    {"id":"DB-MIGRATION-BACKUP-VERIFIED","status":"complete","point":"pre-upgrade backup checksum and source schema are committed before migration chain","expectedRecovery":"migration never begins without one restorable verified backup","faultCheck":"VC-DB-001"},
+    {"id":"DB-MIGRATION-STEP-COMMIT","status":"complete","point":"each registered schema migration step record inside the one ordered migration-chain transaction, keyed by source, target, migration, and step identity","expectedRecovery":"the entire chain, including every step record, is wholly committed or rolled back and can be deterministically re-evaluated","faultCheck":"VC-DB-001"},
+    {"id":"DB-MIGRATION-INTEGRITY-AND-REOPEN","status":"complete","point":"post-chain integrity success and successful restart reopen before writable startup or backup replacement","expectedRecovery":"failed verification blocks writes and preserves live database plus backup","faultCheck":"VC-DB-001"},
+    {"id":"DB-BACKUP-RESTORE-HANDOFF","status":"complete","point":"explicit user-authorized replacement of live database from verified backup","expectedRecovery":"old live database is preserved until restored database passes integrity and reopen checks","faultCheck":"VC-DB-001"}
+  ]
+}

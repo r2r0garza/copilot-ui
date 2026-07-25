@@ -1,0 +1,7 @@
+{
+  "private": true,
+  "scripts": {
+    "prototype": "node prototype/workbench/server.mjs",
+    "validate:spec": "node scripts/validate-spec.mjs"
+  }
+}

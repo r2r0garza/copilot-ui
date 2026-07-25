@@ -1,0 +1,504 @@
+{
+  "schemaVersion": 1,
+  "contractId": "bridgit.sqlite.logical/v1",
+  "sourceDecision": "WF-021",
+  "sqlite": {
+    "journalMode": "WAL",
+    "foreignKeys": true,
+    "synchronous": "FULL",
+    "trustedSchema": false,
+    "writer": "one extension-host writer connection owned by the SQLite adapter",
+    "readers": "bounded read-only connections; every query observes one committed snapshot",
+    "writeBegin": "BEGIN IMMEDIATE",
+    "busyTimeoutMs": 5000,
+    "busyPolicy": "retry reads with bounded jitter; retry a write transaction at most three times before temporarily-unavailable; never retry after external effect handoff",
+    "integrity": ["PRAGMA quick_check on ordinary activation", "PRAGMA foreign_key_check on activation and after migration", "PRAGMA integrity_check before and after backup restore, after migration, and when corruption is suspected"],
+    "crashRule": "an incomplete SQLite transaction rolls back; committed state is authoritative; any effect with intent committed but no known outcome is reconciled before replay"
+  },
+  "columnTypes": {
+    "id": "TEXT containing a canonical 128-scalar-value maximum identity",
+    "version": "INTEGER >= 1, incremented exactly once per accepted aggregate mutation",
+    "instant": "TEXT UTC RFC3339 with millisecond precision",
+    "hash": "TEXT lowercase 64-character SHA-256 hex",
+    "json": "TEXT canonical JSON validated by the adapter against a named closed schema",
+    "bool": "INTEGER restricted to 0 or 1"
+  },
+  "tables": [
+    {
+      "name": "workspace",
+      "owner": "workspace",
+      "columns": ["workspace_id TEXT PRIMARY KEY", "repository_identity_hash TEXT NOT NULL", "canonical_root_token TEXT NOT NULL", "created_at TEXT NOT NULL", "updated_at TEXT NOT NULL", "extension_version TEXT NOT NULL", "schema_version INTEGER NOT NULL", "protocol_version INTEGER NOT NULL", "settings_version INTEGER NOT NULL DEFAULT 1", "settings_json TEXT NOT NULL"],
+      "constraints": ["exactly one row", "schema_version >= 1", "protocol_version >= 1", "settings_version >= 1"]
+    },
+    {
+      "name": "artifacts",
+      "owner": "artifact-store",
+      "columns": ["artifact_id TEXT PRIMARY KEY", "relative_key TEXT NOT NULL UNIQUE", "sha256 TEXT NOT NULL", "byte_length INTEGER NOT NULL", "media_type TEXT NOT NULL", "classification TEXT NOT NULL", "created_at TEXT NOT NULL", "verified_at TEXT", "delete_after TEXT"],
+      "constraints": ["sha256 is lowercase SHA-256", "byte_length >= 0", "classification IN ('chat-content','model-output','tool-payload','tool-result','checkpoint','memory-replacement','support-bundle','diagnostic-evidence','migration-evidence')", "relative_key is adapter-generated beneath private workspace storage and contains no absolute path or traversal"],
+      "lifecycle": "immutable bytes; deletion only after no live typed reference and retention eligibility"
+    },
+    {
+      "name": "application_operations",
+      "owner": "protocol",
+      "columns": ["operation_id TEXT PRIMARY KEY", "request_id TEXT NOT NULL", "command_name TEXT NOT NULL", "fingerprint TEXT NOT NULL", "status TEXT NOT NULL", "result_json TEXT", "error_code TEXT", "correlation_id TEXT NOT NULL", "transaction_id TEXT", "created_at TEXT NOT NULL", "completed_at TEXT"],
+      "constraints": ["UNIQUE(request_id, fingerprint)", "status IN ('accepted','rejected')", "accepted requires result_json, transaction_id, and completed_at", "rejected requires error_code and completed_at", "append-only after completion"],
+      "lifecycle": "retained with the owning authoritative object; exact duplicate returns the recorded result"
+    },
+    {
+      "name": "tasks",
+      "owner": "task",
+      "columns": ["task_id TEXT PRIMARY KEY", "version INTEGER NOT NULL", "state TEXT NOT NULL", "continuation TEXT", "quiescence_disposition TEXT", "queue_ordinal INTEGER", "active_contract_version INTEGER", "active_graph_revision INTEGER", "current_checkpoint_id TEXT", "current_blocker_id TEXT", "created_at TEXT NOT NULL", "updated_at TEXT NOT NULL", "terminal_at TEXT", "trashed_at TEXT"],
+      "constraints": ["version >= 1", "state is a canonical WF-019 Task state", "continuation IS NULL OR continuation IN ('preparing','running','verifying')", "queue_ordinal is non-null only for queued Tasks and is unique when non-null", "terminal_at is present exactly for terminal states", "FOREIGN KEY(current_checkpoint_id) REFERENCES durable_checkpoints(checkpoint_id) RESTRICT", "FOREIGN KEY(current_blocker_id) REFERENCES task_blockers(blocker_id) RESTRICT"],
+      "lifecycle": "soft Trash only after terminal; authoritative history survives Trash; reset is the only bulk destruction"
+    },
+    {
+      "name": "task_contracts",
+      "owner": "task",
+      "columns": ["task_id TEXT NOT NULL", "contract_version INTEGER NOT NULL", "status TEXT NOT NULL", "goal_artifact_id TEXT NOT NULL", "criteria_artifact_id TEXT NOT NULL", "scope_json TEXT NOT NULL", "authority_ceiling_json TEXT NOT NULL", "confirmation_hash TEXT", "repository_baseline_hash TEXT", "created_at TEXT NOT NULL", "confirmed_at TEXT", "superseded_at TEXT", "PRIMARY KEY(task_id, contract_version)"],
+      "constraints": ["FOREIGN KEY(task_id) REFERENCES tasks(task_id) RESTRICT", "FOREIGN KEY(goal_artifact_id) REFERENCES artifacts(artifact_id) RESTRICT", "FOREIGN KEY(criteria_artifact_id) REFERENCES artifacts(artifact_id) RESTRICT", "contract_version >= 1", "status IN ('draft','confirmed','superseded')", "confirmed requires confirmation_hash and confirmed_at", "append-only except monotonic status disposition"]
+    },
+    {
+      "name": "task_dependencies",
+      "owner": "task",
+      "columns": ["dependent_task_id TEXT NOT NULL", "prerequisite_task_id TEXT NOT NULL", "contract_version INTEGER NOT NULL", "request_id TEXT", "accepted_at TEXT NOT NULL", "PRIMARY KEY(dependent_task_id, prerequisite_task_id, contract_version)"],
+      "constraints": ["both Task foreign keys RESTRICT", "dependent_task_id <> prerequisite_task_id", "accepted edge requires succeeded prerequisite for active context", "cycle-prevention trigger on insert", "append-only"]
+    },
+    {
+      "name": "dependency_requests",
+      "owner": "task",
+      "columns": ["request_id TEXT PRIMARY KEY", "task_id TEXT NOT NULL", "contract_version INTEGER NOT NULL", "context TEXT NOT NULL", "candidate_task_id TEXT NOT NULL", "source_phase TEXT", "status TEXT NOT NULL", "rationale TEXT", "created_at TEXT NOT NULL", "resolved_at TEXT"],
+      "constraints": ["Task foreign keys RESTRICT", "context IN ('admission','active')", "status IN ('open','accepted','denied','cancelled')", "UNIQUE(task_id, candidate_task_id, contract_version, context) WHERE status='open'", "resolved_at is present exactly when status is not open"]
+    },
+    {
+      "name": "task_graph_revisions",
+      "owner": "task",
+      "columns": ["task_id TEXT NOT NULL", "revision INTEGER NOT NULL", "contract_version INTEGER NOT NULL", "reason_code TEXT NOT NULL", "proposed_by_attempt_id TEXT", "created_at TEXT NOT NULL", "PRIMARY KEY(task_id, revision)"],
+      "constraints": ["Task and contract foreign keys RESTRICT", "revision >= 1", "append-only"]
+    },
+    {
+      "name": "subtasks",
+      "owner": "task",
+      "columns": ["subtask_id TEXT PRIMARY KEY", "task_id TEXT NOT NULL", "created_revision INTEGER NOT NULL", "superseded_revision INTEGER", "version INTEGER NOT NULL", "state TEXT NOT NULL", "write_capability TEXT NOT NULL", "title TEXT NOT NULL", "completion_artifact_id TEXT", "created_at TEXT NOT NULL", "updated_at TEXT NOT NULL", "terminal_at TEXT"],
+      "constraints": ["FOREIGN KEY(task_id, created_revision) REFERENCES task_graph_revisions(task_id, revision) RESTRICT", "state is a canonical WF-019 Subtask state", "write_capability IN ('read-only','write-capable')", "superseded only from pending or ready", "terminal_at matches terminal classification"]
+    },
+    {
+      "name": "subtask_dependencies",
+      "owner": "task",
+      "columns": ["task_id TEXT NOT NULL", "revision INTEGER NOT NULL", "dependent_subtask_id TEXT NOT NULL", "prerequisite_subtask_id TEXT NOT NULL", "PRIMARY KEY(task_id, revision, dependent_subtask_id, prerequisite_subtask_id)"],
+      "constraints": ["revision and both Subtask foreign keys RESTRICT", "dependent_subtask_id <> prerequisite_subtask_id", "cycle-prevention trigger", "append-only"]
+    },
+    {
+      "name": "task_blockers",
+      "owner": "task",
+      "columns": ["blocker_id TEXT PRIMARY KEY", "task_id TEXT NOT NULL", "version INTEGER NOT NULL", "code TEXT NOT NULL", "status TEXT NOT NULL", "evidence_artifact_id TEXT", "next_action_code TEXT NOT NULL", "created_at TEXT NOT NULL", "resolved_at TEXT"],
+      "constraints": ["FOREIGN KEY(task_id) REFERENCES tasks(task_id) RESTRICT", "status IN ('open','resolved','cancelled')", "one open blocker per Task and code", "resolved_at matches non-open status"]
+    },
+    {
+      "name": "task_amendments",
+      "owner": "task",
+      "columns": ["amendment_id TEXT PRIMARY KEY", "task_id TEXT NOT NULL", "amendment_version INTEGER NOT NULL", "base_contract_version INTEGER NOT NULL", "proposed_contract_version INTEGER NOT NULL", "status TEXT NOT NULL", "rationale TEXT NOT NULL", "confirmation_hash TEXT", "created_at TEXT NOT NULL", "resolved_at TEXT"],
+      "constraints": ["Task and contract foreign keys RESTRICT", "UNIQUE(task_id, amendment_version)", "status IN ('proposed','confirmed','rejected','stale')", "confirmed requires exact confirmation_hash"]
+    },
+    {
+      "name": "repair_cycles",
+      "owner": "task",
+      "columns": ["task_id TEXT NOT NULL", "cycle_ordinal INTEGER NOT NULL", "trigger_subtask_id TEXT", "evidence_artifact_id TEXT", "status TEXT NOT NULL", "created_at TEXT NOT NULL", "completed_at TEXT", "PRIMARY KEY(task_id, cycle_ordinal)"],
+      "constraints": ["Task and Subtask foreign keys RESTRICT", "cycle_ordinal BETWEEN 1 AND 3", "status IN ('active','succeeded','exhausted','cancelled')"]
+    },
+    {
+      "name": "unsatisfiable_determinations",
+      "owner": "task",
+      "columns": ["determination_id TEXT PRIMARY KEY", "task_id TEXT NOT NULL UNIQUE", "reason_code TEXT NOT NULL", "evidence_artifact_id TEXT NOT NULL", "created_at TEXT NOT NULL"],
+      "constraints": ["Task and Artifact foreign keys RESTRICT", "append-only", "required before Task failed"]
+    },
+    {
+      "name": "assignment_attempts",
+      "owner": "task",
+      "columns": ["attempt_id TEXT PRIMARY KEY", "task_id TEXT NOT NULL", "subtask_id TEXT NOT NULL", "ordinal INTEGER NOT NULL", "version INTEGER NOT NULL", "state TEXT NOT NULL", "agent_identity TEXT NOT NULL", "selection_rationale TEXT NOT NULL", "resource_snapshot_id TEXT NOT NULL", "write_capability TEXT NOT NULL", "started_at TEXT", "terminal_at TEXT", "outcome_artifact_id TEXT"],
+      "constraints": ["Task, Subtask, Resource Snapshot, and Artifact foreign keys RESTRICT", "UNIQUE(subtask_id, ordinal)", "state is a canonical WF-019 Assignment Attempt state", "terminal_at matches terminal classification", "append-only identity and selection fields"]
+    },
+    {
+      "name": "chat_sessions",
+      "owner": "chat",
+      "columns": ["chat_id TEXT PRIMARY KEY", "version INTEGER NOT NULL", "agent_identity TEXT NOT NULL", "requested_model_id TEXT", "parent_chat_id TEXT", "fork_through_item_id TEXT", "handoff_from_agent_identity TEXT", "created_at TEXT NOT NULL", "updated_at TEXT NOT NULL", "trashed_at TEXT", "delete_after TEXT"],
+      "constraints": ["FOREIGN KEY(parent_chat_id) REFERENCES chat_sessions(chat_id) RESTRICT", "parent_chat_id IS NULL iff fork_through_item_id IS NULL", "surviving forks RESTRICT parent permanent deletion until shared items are materialized or all child references are absent", "trashed Sessions are excluded from ordinary lists but remain authoritative"]
+    },
+    {
+      "name": "chat_turns",
+      "owner": "chat",
+      "columns": ["turn_id TEXT PRIMARY KEY", "chat_id TEXT NOT NULL", "client_turn_id TEXT NOT NULL", "ordinal INTEGER NOT NULL", "content_artifact_id TEXT NOT NULL", "submitted_at TEXT NOT NULL", "redacted_at TEXT"],
+      "constraints": ["Chat and Artifact foreign keys RESTRICT", "UNIQUE(chat_id, client_turn_id)", "UNIQUE(chat_id, ordinal)", "immutable; redaction replaces referenced artifact with a tombstone artifact through an audited operation"]
+    },
+    {
+      "name": "response_attempts",
+      "owner": "chat",
+      "columns": ["attempt_id TEXT PRIMARY KEY", "chat_id TEXT NOT NULL", "turn_id TEXT NOT NULL", "ordinal INTEGER NOT NULL", "version INTEGER NOT NULL", "state TEXT NOT NULL", "resource_snapshot_id TEXT NOT NULL", "requested_model_id TEXT", "effective_model_id TEXT", "started_at TEXT", "terminal_at TEXT", "partial_output_artifact_id TEXT"],
+      "constraints": ["Chat, Turn, Resource Snapshot, and Artifact foreign keys RESTRICT", "UNIQUE(turn_id, ordinal)", "state is a canonical WF-019 Response Attempt state", "at most one nonterminal attempt per Chat", "terminal attempts are append-only and never resumed"]
+    },
+    {
+      "name": "chat_outputs",
+      "owner": "chat",
+      "columns": ["output_id TEXT PRIMARY KEY", "attempt_id TEXT NOT NULL", "ordinal INTEGER NOT NULL", "kind TEXT NOT NULL", "artifact_id TEXT NOT NULL", "committed_at TEXT NOT NULL", "context_eligible INTEGER NOT NULL"],
+      "constraints": ["Attempt and Artifact foreign keys RESTRICT", "UNIQUE(attempt_id, ordinal)", "kind IN ('assistant','tool-display','limitation','partial')", "context_eligible IN (0,1)", "append-only"]
+    },
+    {
+      "name": "chat_summaries",
+      "owner": "chat",
+      "columns": ["summary_id TEXT PRIMARY KEY", "chat_id TEXT NOT NULL", "ordinal INTEGER NOT NULL", "through_item_id TEXT NOT NULL", "source_fingerprint TEXT NOT NULL", "artifact_id TEXT NOT NULL", "status TEXT NOT NULL", "created_at TEXT NOT NULL", "superseded_at TEXT"],
+      "constraints": ["Chat and Artifact foreign keys RESTRICT", "UNIQUE(chat_id, ordinal)", "status IN ('active','superseded','stale')", "one active summary per Chat", "append-only content"]
+    },
+    {
+      "name": "chat_ledger_entries",
+      "owner": "chat",
+      "columns": ["entry_id TEXT PRIMARY KEY", "chat_id TEXT NOT NULL", "ordinal INTEGER NOT NULL", "version INTEGER NOT NULL", "kind TEXT NOT NULL", "summary TEXT NOT NULL", "source_item_id TEXT NOT NULL", "replaces_entry_id TEXT", "rationale TEXT", "created_at TEXT NOT NULL"],
+      "constraints": ["Chat and replacement foreign keys RESTRICT", "UNIQUE(chat_id, ordinal)", "correction creates a replacement row and never updates prior text", "summary length <= 16384"]
+    },
+    {
+      "name": "chat_context_pins",
+      "owner": "chat",
+      "columns": ["pin_id TEXT PRIMARY KEY", "chat_id TEXT NOT NULL", "context_kind TEXT NOT NULL", "context_ref TEXT NOT NULL", "version_hash TEXT NOT NULL", "created_at TEXT NOT NULL", "removed_at TEXT"],
+      "constraints": ["Chat foreign key RESTRICT", "UNIQUE(chat_id, context_kind, context_ref) WHERE removed_at IS NULL", "removal is monotonic"]
+    },
+    {
+      "name": "resource_snapshots",
+      "owner": "resources",
+      "columns": ["snapshot_id TEXT PRIMARY KEY", "owner_kind TEXT NOT NULL", "owner_attempt_id TEXT NOT NULL UNIQUE", "catalog_generation INTEGER NOT NULL", "effective_model_id TEXT NOT NULL", "created_at TEXT NOT NULL", "fingerprint TEXT NOT NULL UNIQUE"],
+      "constraints": ["owner_kind IN ('assignment-attempt','response-attempt')", "immutable"]
+    },
+    {
+      "name": "resource_snapshot_entries",
+      "owner": "resources",
+      "columns": ["snapshot_id TEXT NOT NULL", "resource_kind TEXT NOT NULL", "identity TEXT NOT NULL", "version_hash TEXT NOT NULL", "origin TEXT NOT NULL", "validation_status TEXT NOT NULL", "metadata_json TEXT NOT NULL", "PRIMARY KEY(snapshot_id, resource_kind, identity)"],
+      "constraints": ["Snapshot foreign key CASCADE only during whole-workbench reset", "metadata is closed, bounded, secret-free canonical JSON", "append-only"]
+    },
+    {
+      "name": "authority_reviews",
+      "owner": "authority",
+      "columns": ["review_id TEXT PRIMARY KEY", "owner_kind TEXT NOT NULL", "owner_id TEXT NOT NULL", "version INTEGER NOT NULL", "requested_scope_json TEXT NOT NULL", "risk_summary TEXT NOT NULL", "status TEXT NOT NULL", "decision TEXT", "confirmation_hash TEXT", "created_at TEXT NOT NULL", "resolved_at TEXT"],
+      "constraints": ["status IN ('open','approved','denied','stale','cancelled')", "resolved fields match terminal status", "one open review per owner and logical scope"]
+    },
+    {
+      "name": "authority_grants",
+      "owner": "authority",
+      "columns": ["grant_id TEXT PRIMARY KEY", "review_id TEXT NOT NULL", "scope_json TEXT NOT NULL", "effect_class TEXT NOT NULL", "owner_kind TEXT NOT NULL", "owner_id TEXT NOT NULL", "resource_snapshot_id TEXT", "issued_at TEXT NOT NULL", "expires_at TEXT", "revoked_at TEXT"],
+      "constraints": ["Review and Snapshot foreign keys RESTRICT", "scope is never broader than approved review", "revocation is monotonic", "contains references and scope only, never credentials"]
+    },
+    {
+      "name": "linked_roots",
+      "owner": "authority",
+      "columns": ["linked_root_id TEXT PRIMARY KEY", "path_token TEXT NOT NULL", "canonical_target_fingerprint TEXT NOT NULL", "grant_id TEXT NOT NULL", "status TEXT NOT NULL", "created_at TEXT NOT NULL", "invalidated_at TEXT"],
+      "constraints": ["Grant foreign key RESTRICT", "UNIQUE(path_token, canonical_target_fingerprint) WHERE status='active'", "status IN ('active','invalidated','removed')", "no absolute host path"]
+    },
+    {
+      "name": "mcp_trust",
+      "owner": "authority",
+      "columns": ["server_identity TEXT NOT NULL", "fingerprint TEXT NOT NULL", "version INTEGER NOT NULL", "decision TEXT NOT NULL", "decided_at TEXT NOT NULL", "invalidated_at TEXT", "PRIMARY KEY(server_identity, fingerprint)"],
+      "constraints": ["decision IN ('trusted','denied')", "trust applies only to exact fingerprint", "no OAuth value or credential"]
+    },
+    {
+      "name": "durable_operations",
+      "owner": "runtime",
+      "columns": ["operation_id TEXT PRIMARY KEY", "version INTEGER NOT NULL", "operation_key TEXT NOT NULL UNIQUE", "parent_kind TEXT NOT NULL", "parent_id TEXT NOT NULL", "state TEXT NOT NULL", "effect_class TEXT NOT NULL", "intent_fingerprint TEXT NOT NULL", "authority_grant_id TEXT NOT NULL", "resource_snapshot_id TEXT", "target_fingerprint TEXT NOT NULL", "intent_artifact_id TEXT", "result_artifact_id TEXT", "next_attempt_at TEXT", "created_at TEXT NOT NULL", "updated_at TEXT NOT NULL", "terminal_at TEXT"],
+      "constraints": ["state is a canonical WF-019 Durable Operation state", "intent identity fields are immutable", "Authority, Snapshot, and Artifact foreign keys RESTRICT", "no raw secret or credential value", "terminal_at matches terminal classification"]
+    },
+    {
+      "name": "operation_execution_attempts",
+      "owner": "runtime",
+      "columns": ["operation_id TEXT NOT NULL", "ordinal INTEGER NOT NULL", "state TEXT NOT NULL", "handoff_started_at TEXT NOT NULL", "finished_at TEXT", "provider_idempotency_ref TEXT", "sanitized_outcome_code TEXT", "evidence_artifact_id TEXT", "PRIMARY KEY(operation_id, ordinal)"],
+      "constraints": ["Operation and Artifact foreign keys RESTRICT", "ordinal >= 1", "state IN ('executing','known-applied','known-not-applied','failed','cancelled','interrupted')", "append-only after terminal"]
+    },
+    {
+      "name": "operation_barriers",
+      "owner": "runtime",
+      "columns": ["barrier_id TEXT PRIMARY KEY", "operation_id TEXT NOT NULL UNIQUE", "scope_kind TEXT NOT NULL", "scope_fingerprint TEXT NOT NULL", "created_at TEXT NOT NULL", "removed_at TEXT", "removal_reason TEXT"],
+      "constraints": ["Operation foreign key RESTRICT", "scope_kind IN ('workspace-mutation','external-target')", "removed_at and reason appear together", "active barrier required for reconciling/outcome-unknown mutations"]
+    },
+    {
+      "name": "reconciliation_evidence",
+      "owner": "runtime",
+      "columns": ["evidence_id TEXT PRIMARY KEY", "operation_id TEXT NOT NULL", "ordinal INTEGER NOT NULL", "classification TEXT NOT NULL", "artifact_id TEXT", "observed_at TEXT NOT NULL"],
+      "constraints": ["Operation and Artifact foreign keys RESTRICT", "UNIQUE(operation_id, ordinal)", "classification IN ('applied','not-applied','inconclusive')", "append-only"]
+    },
+    {
+      "name": "durable_checkpoints",
+      "owner": "runtime",
+      "columns": ["checkpoint_id TEXT PRIMARY KEY", "task_id TEXT NOT NULL", "ordinal INTEGER NOT NULL", "phase TEXT NOT NULL", "graph_revision INTEGER", "repository_baseline_hash TEXT NOT NULL", "continuation_artifact_id TEXT NOT NULL", "last_event_sequence INTEGER NOT NULL", "created_at TEXT NOT NULL"],
+      "constraints": ["Task, graph revision, and Artifact foreign keys RESTRICT", "UNIQUE(task_id, ordinal)", "phase IN ('preparing','running','verifying','quiescing','terminal')", "append-only", "checkpoint can advance only after all included effect outcomes are committed"]
+    },
+    {
+      "name": "tool_audit_records",
+      "owner": "authority",
+      "columns": ["audit_id TEXT PRIMARY KEY", "operation_id TEXT NOT NULL", "ordinal INTEGER NOT NULL", "tool_identity TEXT NOT NULL", "effect_class TEXT NOT NULL", "authority_review_id TEXT", "decision_code TEXT NOT NULL", "input_fingerprint TEXT NOT NULL", "sanitized_input_json TEXT NOT NULL", "sanitized_result_json TEXT", "affected_targets_json TEXT NOT NULL", "started_at TEXT", "terminal_at TEXT", "outcome_code TEXT"],
+      "constraints": ["Operation and Review foreign keys RESTRICT", "UNIQUE(operation_id, ordinal)", "bounded closed JSON only", "append-only; later facts use corrections"]
+    },
+    {
+      "name": "tool_audit_corrections",
+      "owner": "authority",
+      "columns": ["correction_id TEXT PRIMARY KEY", "audit_id TEXT NOT NULL", "ordinal INTEGER NOT NULL", "reason_code TEXT NOT NULL", "sanitized_delta_json TEXT NOT NULL", "created_at TEXT NOT NULL", "UNIQUE(audit_id, ordinal)"],
+      "constraints": ["Audit foreign key RESTRICT", "append-only", "cannot delete or rewrite prior audit"]
+    },
+    {
+      "name": "memory_proposals",
+      "owner": "memory",
+      "columns": ["proposal_id TEXT PRIMARY KEY", "version INTEGER NOT NULL", "kind TEXT NOT NULL", "status TEXT NOT NULL", "scope TEXT NOT NULL", "replacement_artifact_id TEXT", "confirmation_hash TEXT", "repository_baseline_hash TEXT", "created_at TEXT NOT NULL", "resolved_at TEXT"],
+      "constraints": ["Artifact foreign key RESTRICT", "kind IN ('promotion','conflict-resolution','consolidation','personal-ignore')", "status IN ('draft','awaiting-confirmation','confirmed','rejected','stale','applied','failed')", "confirmed requires exact hash and baseline", "rejected sensitive content is deleted when unreferenced"]
+    },
+    {
+      "name": "memory_proposal_sources",
+      "owner": "memory",
+      "columns": ["proposal_id TEXT NOT NULL", "source_identity TEXT NOT NULL", "source_version_hash TEXT NOT NULL", "provenance_id TEXT", "PRIMARY KEY(proposal_id, source_identity)"],
+      "constraints": ["Proposal and provenance foreign keys RESTRICT", "append-only"]
+    },
+    {
+      "name": "memory_proposal_targets",
+      "owner": "memory",
+      "columns": ["proposal_id TEXT NOT NULL", "target_identity TEXT NOT NULL", "expected_version_hash TEXT", "result_version_hash TEXT", "PRIMARY KEY(proposal_id, target_identity)"],
+      "constraints": ["Proposal foreign key RESTRICT", "result version is set only by reconciled successful Memory Write Operation"]
+    },
+    {
+      "name": "memory_provenance",
+      "owner": "memory",
+      "columns": ["provenance_id TEXT PRIMARY KEY", "memory_identity TEXT NOT NULL", "memory_version_hash TEXT NOT NULL", "scope TEXT NOT NULL", "source_kind TEXT NOT NULL", "source_ref TEXT NOT NULL", "proposal_id TEXT", "operation_id TEXT", "created_at TEXT NOT NULL", "superseded_at TEXT"],
+      "constraints": ["Proposal and Operation foreign keys RESTRICT", "UNIQUE(memory_identity, memory_version_hash, source_kind, source_ref)", "private metadata only; no Memory body", "append-only with monotonic superseded_at"]
+    },
+    {
+      "name": "memory_conflicts",
+      "owner": "memory",
+      "columns": ["conflict_id TEXT PRIMARY KEY", "version INTEGER NOT NULL", "status TEXT NOT NULL", "memory_a_identity TEXT NOT NULL", "memory_a_version_hash TEXT NOT NULL", "memory_b_identity TEXT NOT NULL", "memory_b_version_hash TEXT NOT NULL", "reason_code TEXT NOT NULL", "resolution_proposal_id TEXT", "created_at TEXT NOT NULL", "resolved_at TEXT"],
+      "constraints": ["status IN ('open','proposal-pending','resolved','stale')", "ordered identity pair is unique while open", "same-scope only", "resolution never rewrites prior Memory versions"]
+    },
+    {
+      "name": "attention_requests",
+      "owner": "attention",
+      "columns": ["request_id TEXT PRIMARY KEY", "version INTEGER NOT NULL", "owner_kind TEXT NOT NULL", "owner_id TEXT NOT NULL", "code TEXT NOT NULL", "severity TEXT NOT NULL", "notice_summary TEXT NOT NULL", "status TEXT NOT NULL", "dedupe_key TEXT NOT NULL", "created_at TEXT NOT NULL", "updated_at TEXT NOT NULL", "resolved_at TEXT"],
+      "constraints": ["severity IN ('info','warning','error','critical')", "status IN ('open','resolved','cancelled')", "UNIQUE(dedupe_key) WHERE status='open'", "notice_summary is bounded and secret-free"]
+    },
+    {
+      "name": "terminal_outcomes",
+      "owner": "attention",
+      "columns": ["outcome_id TEXT PRIMARY KEY", "owner_kind TEXT NOT NULL", "owner_id TEXT NOT NULL", "outcome_code TEXT NOT NULL", "seen_at TEXT", "dismissed_at TEXT", "created_at TEXT NOT NULL"],
+      "constraints": ["seen_at and dismissed_at are monotonic", "append-only outcome identity"]
+    },
+    {
+      "name": "diagnostic_events",
+      "owner": "diagnostics",
+      "columns": ["diagnostic_id TEXT PRIMARY KEY", "sequence INTEGER NOT NULL UNIQUE", "severity TEXT NOT NULL", "event_code TEXT NOT NULL", "component TEXT NOT NULL", "correlation_id TEXT NOT NULL", "causation_id TEXT", "owner_kind TEXT", "owner_id TEXT", "sanitized_json TEXT NOT NULL", "byte_length INTEGER NOT NULL", "created_at TEXT NOT NULL", "delete_after TEXT"],
+      "constraints": ["metadata-first closed JSON", "byte_length >= 0", "no raw prompt, output, content, diff, Tool payload, command output, secret, or absolute path", "append-only"]
+    },
+    {
+      "name": "diagnostic_pins",
+      "owner": "diagnostics",
+      "columns": ["diagnostic_id TEXT NOT NULL", "pin_kind TEXT NOT NULL", "owner_id TEXT NOT NULL", "pinned_at TEXT NOT NULL", "resolved_at TEXT", "delete_after TEXT", "PRIMARY KEY(diagnostic_id, pin_kind, owner_id)"],
+      "constraints": ["Diagnostic foreign key RESTRICT", "pin_kind IN ('incident','unknown-operation','failed-migration','repository-conflict')", "delete_after is at least 30 days after resolution"]
+    },
+    {
+      "name": "operational_incidents",
+      "owner": "diagnostics",
+      "columns": ["incident_id TEXT PRIMARY KEY", "version INTEGER NOT NULL", "status TEXT NOT NULL", "error_code TEXT NOT NULL", "severity TEXT NOT NULL", "action_required INTEGER NOT NULL", "component TEXT NOT NULL", "correlation_id TEXT NOT NULL", "causation_id TEXT", "owner_refs_json TEXT NOT NULL", "before_state TEXT", "after_state TEXT", "operation_outcome TEXT", "retryability TEXT NOT NULL", "attempt_count INTEGER NOT NULL", "safe_message TEXT NOT NULL", "stack_fingerprint TEXT", "redaction_report_json TEXT NOT NULL", "created_at TEXT NOT NULL", "updated_at TEXT NOT NULL", "resolved_at TEXT", "acknowledged_at TEXT"],
+      "constraints": ["status IN ('open','resolved')", "severity IN ('warning','error','critical')", "action_required IN (0,1)", "attempt_count >= 0", "sanitized bounded fields only", "one open incident per stable dedupe fingerprint"]
+    },
+    {
+      "name": "domain_events",
+      "owner": "runtime",
+      "columns": ["event_id TEXT PRIMARY KEY", "event_name TEXT NOT NULL", "aggregate_kind TEXT NOT NULL", "aggregate_id TEXT NOT NULL", "aggregate_version INTEGER NOT NULL", "workspace_sequence INTEGER NOT NULL UNIQUE", "transaction_id TEXT NOT NULL", "transaction_ordinal INTEGER NOT NULL", "correlation_id TEXT NOT NULL", "causation_id TEXT", "payload_json TEXT NOT NULL", "created_at TEXT NOT NULL"],
+      "constraints": ["UNIQUE(aggregate_kind, aggregate_id, aggregate_version, event_name)", "UNIQUE(transaction_id, transaction_ordinal)", "append-only", "payload validates against the closed WF-020 event schema"]
+    },
+    {
+      "name": "lifecycle_event_identities",
+      "owner": "runtime",
+      "columns": ["event_identity TEXT PRIMARY KEY", "fingerprint TEXT NOT NULL", "event_id TEXT", "rejection_id TEXT", "created_at TEXT NOT NULL"],
+      "constraints": ["exactly one of event_id or rejection_id", "fingerprint mismatch on reuse rejects event-identity-conflict", "immutable"]
+    },
+    {
+      "name": "rejection_records",
+      "owner": "runtime",
+      "columns": ["rejection_id TEXT PRIMARY KEY", "dedupe_key TEXT NOT NULL UNIQUE", "command_name TEXT NOT NULL", "aggregate_kind TEXT", "aggregate_id TEXT", "reason_code TEXT NOT NULL", "correlation_id TEXT NOT NULL", "causation_id TEXT", "created_at TEXT NOT NULL"],
+      "constraints": ["sanitized metadata only", "append-only", "created only after application dispatch as permitted by WF-020"]
+    },
+    {
+      "name": "active_task_slot",
+      "owner": "runtime",
+      "columns": ["singleton INTEGER PRIMARY KEY", "task_id TEXT NOT NULL UNIQUE", "lease_version INTEGER NOT NULL", "acquired_at TEXT NOT NULL"],
+      "constraints": ["singleton = 1", "Task foreign key RESTRICT", "owner Task is in an active nonterminal state", "absence means no owner"]
+    },
+    {
+      "name": "repository_write_lock",
+      "owner": "runtime",
+      "columns": ["singleton INTEGER PRIMARY KEY", "task_id TEXT NOT NULL UNIQUE", "lease_version INTEGER NOT NULL", "acquired_at TEXT NOT NULL"],
+      "constraints": ["singleton = 1", "Task foreign key RESTRICT", "owner equals active_task_slot owner and Task state is preparing, running, quiescing, or verifying", "absence means no owner"]
+    },
+    {
+      "name": "assignment_capacity_leases",
+      "owner": "runtime",
+      "columns": ["attempt_id TEXT PRIMARY KEY", "write_capability TEXT NOT NULL", "acquired_at TEXT NOT NULL"],
+      "constraints": ["Assignment Attempt foreign key RESTRICT", "at most three rows", "at most one write-capable row", "only selected or running Attempt may own"]
+    },
+    {
+      "name": "chat_mutation_capacity",
+      "owner": "runtime",
+      "columns": ["singleton INTEGER PRIMARY KEY", "operation_id TEXT NOT NULL UNIQUE", "acquired_at TEXT NOT NULL"],
+      "constraints": ["singleton = 1", "Operation foreign key RESTRICT", "Operation state is executing and effect is repository mutation", "Repository Write Lock is absent"]
+    },
+    {
+      "name": "recovery_runs",
+      "owner": "runtime",
+      "columns": ["recovery_run_id TEXT PRIMARY KEY", "status TEXT NOT NULL", "trigger_code TEXT NOT NULL", "started_at TEXT NOT NULL", "completed_at TEXT"],
+      "constraints": ["status IN ('running','completed','blocked')", "at most one running row", "completed_at matches terminal status"]
+    },
+    {
+      "name": "recovery_steps",
+      "owner": "runtime",
+      "columns": ["recovery_run_id TEXT NOT NULL", "step_identity TEXT NOT NULL", "ordinal INTEGER NOT NULL", "aggregate_kind TEXT NOT NULL", "aggregate_id TEXT NOT NULL", "step_name TEXT NOT NULL", "status TEXT NOT NULL", "result_json TEXT", "created_at TEXT NOT NULL", "completed_at TEXT", "PRIMARY KEY(recovery_run_id, step_identity)"],
+      "constraints": ["Recovery Run foreign key RESTRICT", "UNIQUE(recovery_run_id, ordinal)", "step_identity is deterministic from run, aggregate, and step", "exact committed replay is a no-op"]
+    },
+    {
+      "name": "workspace_compatibility_gate",
+      "owner": "compatibility",
+      "columns": ["singleton INTEGER PRIMARY KEY", "version INTEGER NOT NULL", "state TEXT NOT NULL", "observed_schema_version INTEGER", "target_schema_version INTEGER NOT NULL", "live_database_identity TEXT NOT NULL", "current_migration_attempt_id TEXT", "updated_at TEXT NOT NULL"],
+      "constraints": ["singleton = 1", "state is a canonical WF-019 compatibility state", "no writable Runtime transaction unless state='compatible'"]
+    },
+    {
+      "name": "migration_attempts",
+      "owner": "compatibility",
+      "columns": ["attempt_id TEXT PRIMARY KEY", "ordinal INTEGER NOT NULL UNIQUE", "state TEXT NOT NULL", "source_schema_version INTEGER NOT NULL", "target_schema_version INTEGER NOT NULL", "source_extension_version TEXT NOT NULL", "target_extension_version TEXT NOT NULL", "live_database_identity TEXT NOT NULL", "backup_id TEXT", "started_at TEXT NOT NULL", "terminal_at TEXT", "failure_code TEXT"],
+      "constraints": ["state is a canonical WF-019 Migration Attempt state", "target_schema_version > source_schema_version", "terminal attempts are immutable and never resumed"]
+    },
+    {
+      "name": "migration_steps",
+      "owner": "compatibility",
+      "columns": ["attempt_id TEXT NOT NULL", "step_id TEXT NOT NULL", "ordinal INTEGER NOT NULL", "source_schema_version INTEGER NOT NULL", "target_schema_version INTEGER NOT NULL", "checksum TEXT NOT NULL", "status TEXT NOT NULL", "applied_at TEXT", "PRIMARY KEY(attempt_id, step_id)"],
+      "constraints": ["Migration Attempt foreign key RESTRICT", "UNIQUE(attempt_id, ordinal)", "status IN ('pending','applied')", "all steps share the one application transaction"]
+    },
+    {
+      "name": "backups",
+      "owner": "compatibility",
+      "columns": ["backup_id TEXT PRIMARY KEY", "relative_key TEXT NOT NULL UNIQUE", "sha256 TEXT NOT NULL", "byte_length INTEGER NOT NULL", "source_schema_version INTEGER NOT NULL", "source_extension_version TEXT NOT NULL", "live_database_identity TEXT NOT NULL", "created_at TEXT NOT NULL", "verified_at TEXT NOT NULL", "replaced_at TEXT"],
+      "constraints": ["private adapter-generated relative key", "one unreplaced restorable pre-upgrade backup", "replacement only after migrated database integrity and reopen success"]
+    },
+    {
+      "name": "recovery_actions",
+      "owner": "compatibility",
+      "columns": ["action_id TEXT PRIMARY KEY", "kind TEXT NOT NULL", "gate_version INTEGER NOT NULL", "live_database_identity TEXT NOT NULL", "backup_id TEXT", "confirmation_hash TEXT NOT NULL", "status TEXT NOT NULL", "operation_key TEXT NOT NULL UNIQUE", "started_at TEXT NOT NULL", "terminal_at TEXT", "evidence_artifact_id TEXT"],
+      "constraints": ["kind IN ('migration-retry','backup-restore','create-fresh','data-reset')", "status IN ('intent-recorded','executing','succeeded','failed','outcome-unknown')", "Backup and Artifact foreign keys RESTRICT", "success returns gate to checking, never directly compatible"]
+    }
+  ],
+  "indexes": [
+    {"name":"idx_tasks_recovery","on":"tasks(state, updated_at, task_id)","purpose":"activation recovery and nonterminal Task lookup"},
+    {"name":"idx_tasks_schedule","on":"tasks(state, queue_ordinal, task_id)","purpose":"stable earliest-ready scheduling"},
+    {"name":"idx_task_dependencies_reverse","on":"task_dependencies(prerequisite_task_id, dependent_task_id)","purpose":"unblock dependents after terminal success"},
+    {"name":"idx_subtasks_ready","on":"subtasks(task_id, state, created_revision, subtask_id)","purpose":"ready scheduling"},
+    {"name":"idx_subtask_dependencies_reverse","on":"subtask_dependencies(task_id, prerequisite_subtask_id, dependent_subtask_id)","purpose":"DAG readiness"},
+    {"name":"idx_assignment_nonterminal","on":"assignment_attempts(state, task_id, subtask_id) WHERE terminal_at IS NULL","purpose":"capacity and recovery"},
+    {"name":"idx_chat_activity","on":"chat_sessions(trashed_at, updated_at DESC, chat_id)","purpose":"Chat list"},
+    {"name":"idx_chat_turn_order","on":"chat_turns(chat_id, ordinal)","purpose":"context reconstruction"},
+    {"name":"idx_response_nonterminal","on":"response_attempts(chat_id, state) WHERE terminal_at IS NULL","purpose":"one active attempt and recovery"},
+    {"name":"idx_operations_recovery","on":"durable_operations(state, updated_at, operation_id)","purpose":"pending intent and uncertain effect recovery"},
+    {"name":"idx_operations_parent","on":"durable_operations(parent_kind, parent_id, created_at)","purpose":"causal lookup"},
+    {"name":"idx_operation_attempts","on":"operation_execution_attempts(operation_id, ordinal)","purpose":"reconciliation"},
+    {"name":"idx_barriers_scope","on":"operation_barriers(scope_kind, scope_fingerprint) WHERE removed_at IS NULL","purpose":"overlap guard"},
+    {"name":"idx_events_aggregate","on":"domain_events(aggregate_kind, aggregate_id, aggregate_version)","purpose":"aggregate history"},
+    {"name":"idx_events_activity","on":"domain_events(workspace_sequence DESC)","purpose":"Activity projection and replay"},
+    {"name":"idx_events_correlation","on":"domain_events(correlation_id, workspace_sequence)","purpose":"causal chain"},
+    {"name":"idx_events_causation","on":"domain_events(causation_id, workspace_sequence)","purpose":"causal chain"},
+    {"name":"idx_audit_operation","on":"tool_audit_records(operation_id, ordinal)","purpose":"operation audit"},
+    {"name":"idx_attention_open","on":"attention_requests(status, severity, updated_at DESC) WHERE status='open'","purpose":"badge and unresolved action lookup"},
+    {"name":"idx_diagnostics_retention","on":"diagnostic_events(delete_after, sequence)","purpose":"30-day/50-MiB cleanup"},
+    {"name":"idx_diagnostics_owner","on":"diagnostic_events(owner_kind, owner_id, sequence)","purpose":"incident and Activity timeline"},
+    {"name":"idx_incidents_open","on":"operational_incidents(status, action_required, severity, updated_at DESC)","purpose":"health and unresolved incident lookup"},
+    {"name":"idx_memory_provenance_identity","on":"memory_provenance(memory_identity, memory_version_hash)","purpose":"provenance and conflict validation"},
+    {"name":"idx_artifact_cleanup","on":"artifacts(delete_after, artifact_id)","purpose":"orphan cleanup candidates"},
+    {"name":"idx_recovery_steps_resume","on":"recovery_steps(recovery_run_id, status, ordinal)","purpose":"deterministic recovery replay"},
+    {"name":"idx_migration_attempts","on":"migration_attempts(state, ordinal DESC)","purpose":"compatibility recovery"}
+  ],
+  "crossRecordTriggers": [
+    "task_dependencies and subtask_dependencies reject cycles through recursive CTE guards",
+    "Task terminal entry rejects an Active Task Slot, Repository Write Lock, open blocker, unresolved dependency/routing request, nonterminal or outcome-unknown operation, or missing required success/failure evidence",
+    "Active Task Slot insertion and removal validate canonical Task state boundaries",
+    "Repository Write Lock insertion requires the same Active Task Slot owner and an executing phase; deletion is paired with the Task transition",
+    "assignment_capacity_leases enforces three total and one write-capable owner",
+    "chat_mutation_capacity requires no Repository Write Lock and one executing mutation operation",
+    "Task, Subtask, Assignment Attempt, Response Attempt, Durable Operation, compatibility, and migration updates validate the exact WF-019 transition matrix",
+    "aggregate version updates require OLD.version + 1 and one matching domain_events row in the same application transaction",
+    "append-only tables reject UPDATE and DELETE outside the migration/reset connection capability",
+    "typed artifact foreign keys are RESTRICT; no reference is cleared until replacement or owner retention allows it"
+  ],
+  "artifactPolicy": {
+    "inline": "identities, enums, bounded summaries, hashes, counters, timestamps, repository-relative path tokens, and closed sanitized metadata JSON only",
+    "artifactBacked": "user prompts, model output, diffs, file bodies, Tool input/results that may contain content, checkpoint continuation bodies, Memory replacements, migration/support evidence, and Support Bundles",
+    "identity": "opaque Artifact ID plus adapter-generated private relative key, SHA-256, byte length, media type, and classification",
+    "writeProtocol": "write temp file, fsync, hash and length verify, atomically rename, then commit the typed SQLite reference; a pre-reference crash leaves an unreferenced candidate",
+    "readProtocol": "resolve only through adapter; verify relative containment, length, and SHA-256 before use",
+    "orphanCleanup": "after startup recovery and daily at most, delete temp files older than 24 hours and immutable artifacts with no typed reference and delete_after elapsed; never delete a referenced, pinned, or backup file",
+    "secrets": "credential values and raw secrets remain in SecretStorage or provider-owned flows; SQLite may hold only opaque handles and non-revealing fingerprints"
+  },
+  "retention": {
+    "taskAndChat": "Trash is a visibility state, not deletion; authoritative history survives Trash. Permanent Chat deletion requires terminal Attempts, no reconciling/outcome-unknown operation, no pinned diagnostic evidence, and no surviving fork reference.",
+    "forks": "a fork is an independent Chat aggregate referencing immutable source items through its fork point; it survives source Trash. Source permanent deletion is RESTRICTed until shared history is materialized into the fork or the fork is deleted.",
+    "audit": "Tool Audit, operation, checkpoint, authority, and application-operation records follow the owning Task or Chat and are not removed by diagnostic cleanup.",
+    "diagnostics": "ordinary events expire at 30 days or when total stored diagnostic bytes exceed 50 MiB; oldest unpinned first. Resolved pins expire no earlier than 30 days after resolution.",
+    "reset": "workbench.data.reset is the only command allowed to destroy all workspace operational records and private artifacts; it preserves only an external sanitized reset audit/incident if the live database is replaced."
+  },
+  "transactionProfiles": {
+    "stateEvent": "BEGIN IMMEDIATE; validate compatibility, expected versions, lifecycle and authority; insert application_operations accepted row; mutate owned aggregate and dependent rows; append exactly ordered domain_events and required audit/attention/diagnostic facts; store result; COMMIT",
+    "intentBeforeEffect": "transaction A records immutable Durable Operation intent, Operation Key, authority and Tool audit plus operation.intent-recorded; external effect occurs only after commit; transaction B records known outcome or reconciliation state, audit evidence, caller state/checkpoint and events",
+    "externalPreparation": "commit proposal/preview/interaction state and event; perform native UI or read-only discovery outside the transaction; commit returned metadata or failure in a new stateEvent transaction",
+    "readOnlyExternal": "no authoritative SQLite state or Domain Event; native UI action may emit only redacted ephemeral diagnostics",
+    "compatibilityExternal": "uses the compatibility/recovery connection while Runtime writes are disabled; record intent outside the live database when it is unsafe, execute backup/restore/fresh operation, then reopen at checking; never pretend atomicity across filesystem replacement",
+    "destructiveReset": "close Runtime connections, record exact confirmed recovery action, atomically move live database and artifact root to a private Trash location, create and verify a fresh v1 store, then delete old data only after reopen success"
+  },
+  "commandMap": {
+    "stateEvent": [
+      "task.admission.start", "task.dependency.resolve", "task.contract.confirm", "task.queued.edit", "task.queue.reorder",
+      "task.pause", "task.resume", "task.cancel", "task.force-stop", "task.amendment.confirm", "task.routing.resolve",
+      "task.repair-intervention.apply", "task.reactivation.retry", "task.terminal-outcome.acknowledge",
+      "chat.session.create", "chat.turn.send", "chat.attempt.cancel", "chat.attempt.retry", "chat.session.fork",
+      "chat.session.handoff", "chat.session.trash", "chat.session.restore", "chat.session.delete-permanently",
+      "chat.summary.generate", "chat.ledger.correct", "chat.context-pin.add", "chat.context-pin.remove",
+      "chat.approval.resolve",
+      "mcp.server.trust.resolve", "mcp.interaction.submit", "mcp.interaction.cancel",
+      "authority.chat-auto-review.resolve", "authority.linked-root.resolve",
+      "memory.promotion.start", "memory.conflict.propose-resolution",
+      "attention.resolve", "attention.dismiss-outcome", "diagnostics.incident.acknowledge",
+      "settings.update", "settings.reset"
+    ],
+    "intentBeforeEffect": [
+      "chat.privacy-redaction.execute", "agent.proposal.resolve",
+      "agent.update-proposal.resolve", "resource.personal-memory-ignore.apply",
+      "authority.operation-reconciliation.start", "memory.proposal.resolve",
+      "diagnostics.clear", "diagnostics.support-bundle.create"
+    ],
+    "externalPreparation": [
+      "resource.discovery.refresh", "mcp.oauth.start", "diagnostics.health.run",
+      "diagnostics.support-bundle.preview", "recovery.run.retry"
+    ],
+    "readOnlyExternal": ["agent.source.open", "resource.source.open"],
+    "compatibilityExternal": [
+      "compatibility.migration.retry", "compatibility.backup.restore",
+      "compatibility.database.create-fresh", "compatibility.recheck"
+    ],
+    "destructiveReset": ["workbench.data.reset"]
+  },
+  "recoveryActions": [
+    {"name":"activation.recover","atomicWrites":["recovery_runs","recovery_steps","tasks","assignment_attempts","response_attempts","operation_barriers","active_task_slot","repository_write_lock","domain_events"],"rule":"persist run/worklist first; each deterministic step is its own BEGIN IMMEDIATE transaction"},
+    {"name":"operation.reconcile","atomicWrites":["durable_operations","reconciliation_evidence","operation_barriers","tool_audit_corrections","domain_events","diagnostic_events"],"rule":"classification and resulting operation/barrier/audit event commit together"},
+    {"name":"checkpoint.restore","atomicWrites":["recovery_steps","tasks","task_blockers","domain_events"],"rule":"restored continuation or explicit blocker and recovery progress commit together"},
+    {"name":"migration.apply","atomicWrites":["all schema objects","migration_steps"],"rule":"the full ordered chain and target verification run in one exclusive migration transaction after verified backup"},
+    {"name":"backup.restore","atomicWrites":["recovery_actions"],"rule":"live database replacement is filesystem-atomic, externally audited, followed by checking; no Runtime write transaction spans replacement"},
+    {"name":"artifact.orphan-cleanup","atomicWrites":["artifacts"],"rule":"select eligible unreferenced rows in a snapshot, delete files idempotently, then delete metadata in a short BEGIN IMMEDIATE transaction; failure leaves retryable metadata"}
+  ],
+  "verification": {
+    "schemaAssertions": [
+      "every table, column, foreign key, unique key, check, index, and trigger is generated from this contract and introspected from a migrated database",
+      "all aggregate state enums and transition triggers equal the WF-019 lifecycle catalog",
+      "all event names and payload schema identifiers equal the WF-020 protocol catalog",
+      "every WF-020 state-changing command occurs exactly once in commandMap and every read-only command is explicitly classified",
+      "all artifact reference columns are included in the orphan-reference union",
+      "all append-only tables reject unauthorized update and delete"
+    ],
+    "faultInjection": [
+      "before BEGIN, after each row write, before COMMIT, after COMMIT, before effect handoff, during effect, before outcome commit, and after outcome commit",
+      "WAL busy/locked, disk full, artifact short write, checksum mismatch, corrupt page, foreign-key violation, trigger rejection, host termination, stale lease, and migration reopen failure"
+    ],
+    "requiredOutcomes": "committed state/event/audit agree, or the transaction is absent; external effects are known or blocked behind reconciliation; no impossible lease, lifecycle, graph, fork, retention, or artifact state becomes writable"
+  }
+}

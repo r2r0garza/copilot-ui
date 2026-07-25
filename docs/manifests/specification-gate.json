@@ -1,0 +1,45 @@
+{
+  "schemaVersion": 1,
+  "specRevision": "mvp-spec/2",
+  "evaluatedAt": "2026-07-25",
+  "gate": "Specification Acceptance Gate",
+  "status": "accepted",
+  "machineValidation": {
+    "command": "npm run validate:spec",
+    "expectedStatus": "pass",
+    "structuralErrors": 0,
+    "acceptanceBlockers": 0
+  },
+  "semanticReview": {
+    "reviewer": "Codex",
+    "completed": true,
+    "criteria": {
+      "settled-decisions-preserved": "pass",
+      "terminology-consistent": "pass",
+      "normative-requirements-identifiable": "pass",
+      "requirements-atomic-and-observable": "pass",
+      "oracles-prove-requirements": "pass",
+      "cross-feature-contracts-complete": "pass",
+      "no-concealed-product-or-architecture-choice": "pass",
+      "unresolved-item-count-zero": "pass"
+    }
+  },
+  "blockerReview": [
+    {"id":"GAP-001","classification":"unresolved-decision","status":"resolved","ticket":"WF-020","reason":"The closed Workbench Protocol decision fixes exact identities, payloads, ordering, reconstruction, validation, correlation, idempotency, and error behavior and is integrated as a normative annex."},
+    {"id":"GAP-002","classification":"unresolved-decision","status":"resolved","ticket":"WF-021","reason":"The closed logical SQLite decision and machine contract fix relational shape, constraints, indexes, artifacts, retention, recovery, and all command transaction boundaries."},
+    {"id":"GAP-003","classification":"unresolved-decision","status":"resolved","ticket":"WF-019","reason":"The closed Lifecycle decision fixes all canonical states, transitions, guards, effects, events, rejections, leases, operation states, and recovery steps."},
+    {"id":"GAP-004","classification":"mechanical-spec-defect","status":"fixed","ticket":null,"reason":"Assets, boundaries, controls, and residual risks are derivable from settled security, authority, diagnostics, packaging, and recovery decisions."},
+    {"id":"GAP-005","classification":"mechanical-spec-defect","status":"fixed","ticket":null,"reason":"The settled durability protocol already names the logical commit and external-handoff points; the registry projection was missing."},
+    {"id":"GAP-006","classification":"mechanical-spec-defect","status":"fixed","ticket":null,"reason":"The settled fourteen journeys already determine synthetic setup, actions, observable outcomes, cleanup, and evidence obligations."}
+  ],
+  "unresolvedItems": [],
+  "acceptanceRecord": {
+    "recordId": "SAR-mvp-spec-2",
+    "acceptedRevision": "mvp-spec/2",
+    "acceptedAt": "2026-07-25",
+    "acceptedBy": "Project owner",
+    "acceptanceBasis": "Explicit instruction to complete specification assembly, manifest updates, validation, and the Specification Acceptance Record after all Wayfinder decisions were closed.",
+    "semanticReviewer": "Codex",
+    "implementationClaim": "Specification acceptance only; no implementation or release verification is claimed."
+  }
+}
