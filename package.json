@@ -33,7 +33,8 @@
     "compile": "tsc -p ./",
     "check": "tsc -p ./ --noEmit",
     "validate:spec": "node scripts/validate-spec.mjs",
-    "test": "npm run check && npm run validate:spec",
+    "test:unit": "tsc -p tsconfig.test.json && node --test .tmp-test/test/**/*.test.js",
+    "test": "npm run check && npm run test:unit && npm run validate:spec",
     "prototype": "node prototype/workbench/server.mjs"
   },
   "devDependencies": {
