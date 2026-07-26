@@ -42,6 +42,7 @@
     "validate:spec": "node scripts/validate-spec.mjs",
     "test:unit": "tsc -p tsconfig.test.json && find .tmp-test/test -name '*.test.js' -print0 | xargs -0 node --test",
     "test": "npm run check && npm run test:unit && npm run validate:spec",
+    "rebuild:vscode": "electron-rebuild --version 42.6.0 --arch arm64 --only better-sqlite3",
     "prototype": "node prototype/workbench/server.mjs"
   },
   "dependencies": {
@@ -51,6 +52,7 @@
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.13",
+    "@electron/rebuild": "^4.0.0",
     "@types/node": "^22.15.3",
     "@types/vscode": "^1.125.0",
     "typescript": "^5.8.3"
