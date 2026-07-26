@@ -64,6 +64,12 @@ test("keeps lifecycle, forks, trash, summaries, ledger, and audits append-only",
   store.restoreChat(chat.chatId); assert.equal(store.listChats().length, 2); store.close();
 });
 
+test("permanent deletion preserves surviving forks without their deleted-origin pointer", () => {
+  const store = new WorkspaceStore(mkdtempSync(join(tmpdir(), "bridgit-fork-delete-")));
+  const source = store.createChat("bundled:orchestrator", null); const fork = store.forkChat(source.chatId, "bundled:orchestrator"); store.trashChat(source.chatId); store.deleteChatPermanently(source.chatId, true);
+  assert.equal(store.getChat(source.chatId), undefined); assert.equal(store.getChat(fork.chatId)?.originChatId, null); store.close();
+});
+
 test("turns an abandoned active attempt into an interrupted, retryable record on host restart", () => {
   const directory = mkdtempSync(join(tmpdir(), "bridgit-restart-"));
   const writer = new WorkspaceStore(directory); const chat = writer.createChat("bundled:orchestrator", null); const turn = writer.submitTurn(chat.chatId, "Continue"); const attempt = writer.createResponseAttempt(turn.turnId, "model-a"); writer.transitionAttempt(attempt.attemptId, "running"); writer.close();
