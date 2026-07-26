@@ -26,20 +26,26 @@ export function createWorkbenchPanel(
     if (!isSendMessage(message)) return;
     const content = message.content.trim();
     if (!content) return;
+    let activeAttemptId: string | undefined;
     try {
       const authority = getStore();
       const chat = authority.listChats()[0] ?? authority.createChat("bundled:orchestrator", null);
       const turn = authority.submitTurn(chat.chatId, content);
       const [model] = await vscode.lm.selectChatModels();
       if (!model) throw new Error("No chat model is available. Sign in to GitHub Copilot and try again.");
-      authority.createResponseAttempt(turn.turnId, model.id);
+      const attempt = authority.createResponseAttempt(turn.turnId, model.id, undefined, model.id);
+      activeAttemptId = attempt.attemptId;
+      authority.transitionAttempt(attempt.attemptId, "running");
       const cancellation = new vscode.CancellationTokenSource();
       const response = await model.sendRequest([vscode.LanguageModelChatMessage.User(content)], {}, cancellation.token);
       let output = "";
       for await (const fragment of response.text) { output += fragment; authority.checkpointOutput(turn.turnId, output); await panel.webview.postMessage({ type: "chat-stream", content: output }); }
       authority.appendOutput(turn.turnId, output || "The model returned no visible text.");
+      authority.transitionAttempt(attempt.attemptId, "succeeded");
       await sendState();
     } catch (error) {
+      // Submitted turns and any streamed checkpoint stay durable; no attempt is silently retried.
+      if (activeAttemptId) { try { getStore().transitionAttempt(activeAttemptId, "failed"); } catch { /* Preserve the original classified failure. */ } }
       await panel.webview.postMessage({ type: "chat-error", message: error instanceof Error ? error.message : "Unable to send this Chat message." });
     }
   });

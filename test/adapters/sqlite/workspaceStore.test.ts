@@ -48,3 +48,15 @@ test("restores an interrupted streamed response and replaces it with its immutab
   assert.deepEqual(reader.listOutputs(chat.chatId).map((output) => output.content), ["Complete response"]);
   reader.close();
 });
+
+test("keeps lifecycle, forks, trash, summaries, ledger, and audits append-only", () => {
+  const store = new WorkspaceStore(mkdtempSync(join(tmpdir(), "bridgit-m2-")));
+  const chat = store.createChat("bundled:orchestrator", null); const turn = store.submitTurn(chat.chatId, "Use a tool");
+  const attempt = store.createResponseAttempt(turn.turnId, "model-a", undefined, "model-a", "snapshot-1");
+  store.transitionAttempt(attempt.attemptId, "running"); store.transitionAttempt(attempt.attemptId, "cancelled");
+  const ledger = store.appendLedger(chat.chatId, "fact", "User prefers tests", "user-turn"); store.correctLedger(ledger.entryId, "User prefers focused tests", "user-correction");
+  store.createSummary(chat.chatId, "Short history", "turns:1");
+  store.recordToolAudit({ auditId: "audit-1", attemptId: attempt.attemptId, operationKey: "op-1", toolIdentity: "files/read", snapshotId: "snapshot-1", decision: "allowed", input: "{}", outcome: null, createdAt: "2026-07-25T00:00:00.000Z", completedAt: null });
+  const fork = store.forkChat(chat.chatId, "bundled:orchestrator"); store.trashChat(chat.chatId); assert.equal(store.listChats().length, 1); assert.equal(store.listChats()[0]?.chatId, fork.chatId);
+  store.restoreChat(chat.chatId); assert.equal(store.listChats().length, 2); store.close();
+});
