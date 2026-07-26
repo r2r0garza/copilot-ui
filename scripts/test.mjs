@@ -1,6 +1,6 @@
 import { spawnSync } from "node:child_process";
 
-const command = process.platform === "win32" ? "npm.cmd" : "npm";
+const command = process.platform === "win32" ? "pnpm.cmd" : "pnpm";
 const run = (args) => {
   const result = spawnSync(command, args, { stdio: "inherit" });
   if (result.error) throw result.error;
