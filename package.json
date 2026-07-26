@@ -21,6 +21,12 @@
     "onCommand:bridgit.openWorkbench"
   ],
   "contributes": {
+    "viewsContainers": {
+      "activitybar": [{ "id": "bridgit", "title": "Bridgit", "icon": "$(hubot)" }]
+    },
+    "views": {
+      "bridgit": [{ "id": "bridgit.launcher", "name": "Bridgit" }]
+    },
     "commands": [
       {
         "command": "bridgit.openWorkbench",
