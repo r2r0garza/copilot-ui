@@ -57,6 +57,8 @@ test("keeps lifecycle, forks, trash, summaries, ledger, and audits append-only",
   const ledger = store.appendLedger(chat.chatId, "fact", "User prefers tests", "user-turn"); store.correctLedger(ledger.entryId, "User prefers focused tests", "user-correction");
   store.createSummary(chat.chatId, "Short history", "turns:1");
   store.recordToolAudit({ auditId: "audit-1", attemptId: attempt.attemptId, operationKey: "op-1", toolIdentity: "files/read", snapshotId: "snapshot-1", decision: "allowed", input: "{}", outcome: null, createdAt: "2026-07-25T00:00:00.000Z", completedAt: null });
+  const snapshot = store.pinResourceSnapshot(attempt.attemptId, "{\"model\":\"model-a\"}"); assert.equal(snapshot.attemptId, attempt.attemptId);
+  assert.equal(store.acquireRepositoryWriteLock(attempt.attemptId), true); assert.equal(store.repositoryWriteLocked(), true); assert.equal(store.releaseRepositoryWriteLock(attempt.attemptId), true);
   const fork = store.forkChat(chat.chatId, "bundled:orchestrator"); store.trashChat(chat.chatId); assert.equal(store.listChats().length, 1); assert.equal(store.listChats()[0]?.chatId, fork.chatId);
   store.restoreChat(chat.chatId); assert.equal(store.listChats().length, 2); store.close();
 });
