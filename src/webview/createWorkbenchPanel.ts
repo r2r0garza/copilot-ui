@@ -18,19 +18,39 @@ export function createWorkbenchPanel(
 
   let store: WorkspaceStore | undefined;
   const getStore = (): WorkspaceStore => store ??= new WorkspaceStore((context.storageUri ?? context.globalStorageUri).fsPath);
-  const sendState = (): Thenable<boolean> => panel.webview.postMessage({ type: "chat-state", state: chatState(getStore()) });
-  let initialState: ChatState = { messages: [] };
-  try { initialState = chatState(getStore()); } catch { /* The panel remains usable and surfaces storage errors on Send. */ }
+  let selectedChatId: string | undefined;
+  let showingTrash = false;
+  const currentState = (): ChatState => chatState(getStore(), selectedChatId, showingTrash);
+  const sendState = (): Thenable<boolean> => { const state = currentState(); selectedChatId = state.selectedChatId; return panel.webview.postMessage({ type: "chat-state", state }); };
+  let initialState: ChatState = { chats: [], selectedChatId: undefined, showingTrash: false, messages: [] };
+  try { initialState = currentState(); selectedChatId = initialState.selectedChatId; } catch { /* The panel remains usable and surfaces storage errors on Send. */ }
   panel.webview.html = renderWorkbench(panel.webview, initialState);
   panel.webview.onDidReceiveMessage(async (message: unknown) => {
+    if (isChatAction(message)) {
+      try {
+        const authority = getStore(); const selected = selectedChatId;
+        if (message.action === "new") { selectedChatId = authority.createChat("bundled:orchestrator", null).chatId; showingTrash = false; }
+        else if (message.action === "toggle-trash") showingTrash = !showingTrash;
+        else if (message.action === "select") { if (message.chatId && authority.getChat(message.chatId)) selectedChatId = message.chatId; }
+        else if (!selected) throw new Error("select-or-create-a-chat-first");
+        else if (message.action === "fork") { selectedChatId = authority.forkChat(selected, authority.getChat(selected)?.agentIdentity ?? "bundled:orchestrator").chatId; showingTrash = false; }
+        else if (message.action === "trash") { authority.trashChat(selected); selectedChatId = authority.listChats()[0]?.chatId; showingTrash = false; }
+        else if (message.action === "restore") { authority.restoreChat(selected); showingTrash = false; }
+        else if (message.action === "delete") { authority.deleteChatPermanently(selected, true); selectedChatId = authority.listChats(true)[0]?.chatId; }
+        await sendState();
+      } catch (error) { await panel.webview.postMessage({ type: "chat-error", message: error instanceof Error ? error.message : "Unable to update this Chat." }); }
+      return;
+    }
     if (!isSendMessage(message)) return;
     const content = message.content.trim();
     if (!content) return;
     let activeAttemptId: string | undefined;
     try {
       const authority = getStore();
-      const chat = authority.listChats()[0] ?? authority.createChat("bundled:orchestrator", null);
-      const turn = authority.submitTurn(chat.chatId, content);
+      const chat = selectedChatId ? authority.getChat(selectedChatId) : undefined;
+      const targetChat = chat ?? authority.createChat("bundled:orchestrator", null);
+      selectedChatId = targetChat.chatId;
+      const turn = authority.submitTurn(targetChat.chatId, content);
       const [model] = await vscode.lm.selectChatModels();
       if (!model) throw new Error("No chat model is available. Sign in to GitHub Copilot and try again.");
       const attempt = authority.createResponseAttempt(turn.turnId, model.id, undefined, model.id);
@@ -100,6 +120,15 @@ function renderWorkbench(webview: vscode.Webview, state: ChatState): string {
       .subtask:last-child { border-bottom: 0; }
       .subtask small { color: var(--vscode-descriptionForeground); }
       .chat-layout { display: flex; flex-direction: column; gap: 16px; max-width: 800px; }
+      .chat-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; }
+      .chat-actions, .chat-toolbar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+      .chat-shell { display: grid; grid-template-columns: 190px minmax(0, 1fr); gap: 14px; height: calc(100vh - 240px); min-height: 0; }
+      .session-list { padding: 8px; overflow-y: auto; border: 1px solid var(--vscode-panel-border); background: var(--vscode-sideBar-background); }
+      .session-item { display: flex; width: 100%; justify-content: space-between; gap: 8px; padding: 9px; border: 0; border-radius: 3px; background: transparent; text-align: left; cursor: pointer; }
+      .session-item[aria-current="true"] { background: var(--vscode-list-activeSelectionBackground); color: var(--vscode-list-activeSelectionForeground); }
+      .session-item small, .muted { color: var(--vscode-descriptionForeground); }
+      .quiet-action, .danger-action { padding: 7px 10px; border: 1px solid var(--vscode-panel-border); border-radius: 3px; background: transparent; cursor: pointer; }
+      .danger-action { color: var(--vscode-errorForeground); }
       .transcript { min-height: 0; display: flex; flex: 1; flex-direction: column; align-items: flex-start; gap: 12px; padding: 18px; overflow-y: auto; border: 1px solid var(--vscode-panel-border); background: var(--vscode-editorWidget-background); }
       .message { width: fit-content; max-width: min(78%, 620px); padding: 10px 13px; border-radius: 5px; border-left: 2px solid var(--vscode-testing-iconPassed); background: var(--vscode-textBlockQuote-background); white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.55; }
       .message.user { align-self: flex-end; border-left: 0; border-right: 2px solid var(--vscode-focusBorder); background: var(--vscode-input-background); }
@@ -110,9 +139,9 @@ function renderWorkbench(webview: vscode.Webview, state: ChatState): string {
       textarea:focus { outline: 1px solid var(--vscode-focusBorder); outline-offset: -1px; }
       .send { align-self: end; padding: 9px 14px; color: var(--vscode-button-foreground); border: 0; border-radius: 2px; background: var(--vscode-button-background); cursor: pointer; font-weight: 600; }
       .view#chats { max-width: none; height: calc(100vh - 108px); min-height: 0; }
-      .chat-layout { width: min(100%, 1280px); max-width: none; height: calc(100vh - 240px); min-height: 0; }
+      .chat-layout { width: min(100%, 1280px); max-width: none; min-height: 0; }
       .composer { position: sticky; bottom: 0; padding-top: 10px; background: var(--vscode-editor-background); }
-      @media (max-width: 700px) { .workbench { grid-template-columns: 58px minmax(0, 1fr); } .brand span, .nav-label, .rail-footer { display: none; } .brand { justify-content: center; margin-inline: 0; } .nav-button { justify-content: center; padding-inline: 4px; } .board { grid-template-columns: 1fr; } .card--wide { grid-column: auto; } .content { padding: 24px 18px; } }
+      @media (max-width: 700px) { .workbench { grid-template-columns: 58px minmax(0, 1fr); } .brand span, .nav-label, .rail-footer { display: none; } .brand { justify-content: center; margin-inline: 0; } .nav-button { justify-content: center; padding-inline: 4px; } .board, .chat-shell { grid-template-columns: 1fr; } .session-list { max-height: 110px; } .card--wide { grid-column: auto; } .content { padding: 24px 18px; } .chat-heading { display: block; } }
     </style>
   </head>
   <body>
@@ -147,22 +176,28 @@ function renderWorkbench(webview: vscode.Webview, state: ChatState): string {
         for (const view of views) view.dataset.active = String(view.id === target);
         if (target === 'chats') requestAnimationFrame(scrollToLatest);
       });
-      const vscode = acquireVsCodeApi(); const form = document.querySelector('#chat-form'); const input = document.querySelector('#chat-input'); const transcript = document.querySelector('#transcript'); const error = document.querySelector('#chat-error'); const scrollToLatest = () => { transcript.scrollTop = transcript.scrollHeight; }; const escapeHtml = (value) => value.replace(/[&<>]/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+      const vscode = acquireVsCodeApi(); const form = document.querySelector('#chat-form'); const input = document.querySelector('#chat-input'); const error = document.querySelector('#chat-error'); const transcript = () => document.querySelector('#transcript'); const scrollToLatest = () => { const element = transcript(); if (element) element.scrollTop = element.scrollHeight; }; const escapeHtml = (value) => value.replace(/[&<>]/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
       const resizeComposer = () => { input.style.height = 'auto'; input.style.height = Math.min(input.scrollHeight, 322) + 'px'; input.style.overflowY = input.scrollHeight > 322 ? 'auto' : 'hidden'; };
       input?.addEventListener('input', resizeComposer);
       input?.addEventListener('keydown', (event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); form?.requestSubmit(); } });
-      form?.addEventListener('submit', (event) => { event.preventDefault(); const content = input.value; if (content.trim()) { transcript.innerHTML += '<div class="message user"><strong>you</strong><br>' + escapeHtml(content) + '</div><div id="streaming-response" class="message assistant"><strong>Bridgit</strong><br><span></span></div>'; scrollToLatest(); error.textContent = 'Sending…'; vscode.postMessage({ type: 'chat-send', content }); input.value = ''; resizeComposer(); } });
-      window.addEventListener('message', (event) => { const message = event.data; if (message.type === 'chat-state') { transcript.innerHTML = message.state.messages.map((item) => '<div class="message ' + item.role + '"><strong>' + (item.role === 'user' ? 'you' : 'Bridgit') + '</strong><br>' + escapeHtml(item.content) + '</div>').join('') || '<p class="muted">Start a durable Chat session below.</p>'; scrollToLatest(); error.textContent = ''; } if (message.type === 'chat-stream') { const stream = document.querySelector('#streaming-response span'); if (stream) { stream.textContent = message.content; scrollToLatest(); } } if (message.type === 'chat-error') error.textContent = message.message; });
+      form?.addEventListener('submit', (event) => { event.preventDefault(); const content = input.value; const element = transcript(); if (content.trim() && element) { element.innerHTML += '<div class="message user"><strong>you</strong><br>' + escapeHtml(content) + '</div><div id="streaming-response" class="message assistant"><strong>Bridgit</strong><br><span></span></div>'; scrollToLatest(); error.textContent = 'Sending…'; vscode.postMessage({ type: 'chat-send', content }); input.value = ''; resizeComposer(); } });
+      document.addEventListener('click', (event) => { const control = event.target.closest('[data-chat-action]'); if (!control) return; const action = control.dataset.chatAction; if (action === 'delete' && !confirm('Permanently delete this trashed Chat? This cannot be undone.')) return; vscode.postMessage({ type: 'chat-action', action, chatId: control.dataset.chatId }); });
+      const renderState = (state) => { const sessions = document.querySelector('#session-list'); const toolbar = document.querySelector('#chat-toolbar'); const element = transcript(); if (sessions) sessions.innerHTML = state.chats.map((chat) => '<button class="session-item" data-chat-action="select" data-chat-id="' + chat.chatId + '" aria-current="' + String(chat.chatId === state.selectedChatId) + '"><span>' + chat.label + '</span>' + (chat.forked ? '<small>Fork</small>' : '') + '</button>').join('') || '<p class="muted">' + (state.showingTrash ? 'Trash is empty.' : 'No chats yet.') + '</p>'; if (toolbar) toolbar.innerHTML = !state.selectedChatId ? '<span class="muted">Create a Chat to begin.</span>' : state.showingTrash ? '<button data-chat-action="restore" class="quiet-action" type="button">Restore</button><button data-chat-action="delete" class="danger-action" type="button">Delete permanently</button>' : '<button data-chat-action="fork" class="quiet-action" type="button">Fork</button><button data-chat-action="trash" class="quiet-action" type="button">Move to Trash</button>'; if (element) element.innerHTML = state.messages.map((item) => '<div class="message ' + item.role + '"><strong>' + (item.role === 'user' ? 'you' : 'Bridgit') + '</strong><br>' + escapeHtml(item.content) + '</div>').join('') || '<p class="muted">Start a durable Chat session below.</p>'; scrollToLatest(); error.textContent = ''; };
+      window.addEventListener('message', (event) => { const message = event.data; if (message.type === 'chat-state') renderState(message.state); if (message.type === 'chat-stream') { const stream = document.querySelector('#streaming-response span'); if (stream) { stream.textContent = message.content; scrollToLatest(); } } if (message.type === 'chat-error') error.textContent = message.message; });
     </script>
   </body>
 </html>`;
 }
 
-interface ChatState { readonly messages: readonly { readonly role: "user" | "assistant"; readonly content: string }[]; }
-function chatState(store: WorkspaceStore): ChatState { const chat = store.listChats()[0]; if (!chat) return { messages: [] }; const messages = [...store.listTurns(chat.chatId).map((turn) => ({ role: "user" as const, content: turn.content, createdAt: turn.submittedAt })), ...store.listOutputs(chat.chatId).map((output) => ({ role: "assistant" as const, content: output.content, createdAt: output.createdAt }))].sort((left, right) => left.createdAt.localeCompare(right.createdAt)); return { messages: messages.map(({ role, content }) => ({ role, content })) }; }
-function chatsView(state: ChatState): string { return `<section id="chats" class="view" data-active="false"><p class="eyebrow">Session-first conversations</p><h1>Chats</h1><p class="lede">Your messages and model responses are stored locally and rebuild after reload.</p><div class="chat-layout"><div id="transcript" class="transcript">${state.messages.map((item) => `<div class="message ${item.role}"><strong>${item.role === "user" ? "you" : "Bridgit"}</strong><br>${escapeHtml(item.content)}</div>`).join("") || "<p>Start a durable Chat session below.</p>"}</div><p id="chat-error" class="chat-error" role="status"></p><form id="chat-form" class="composer"><textarea id="chat-input" aria-label="Chat message" aria-multiline="true" rows="1" placeholder="Message Bridgit…"></textarea><button class="send" type="submit">Send</button></form></div></section>`; }
+interface ChatState { readonly chats: readonly { readonly chatId: string; readonly label: string; readonly trashed: boolean; readonly forked: boolean }[]; readonly selectedChatId: string | undefined; readonly showingTrash: boolean; readonly messages: readonly { readonly role: "user" | "assistant"; readonly content: string }[]; }
+function chatState(store: WorkspaceStore, requestedChatId: string | undefined, showingTrash: boolean): ChatState { const chats = store.listChats(true).filter((chat) => showingTrash ? Boolean(chat.trashedAt) : !chat.trashedAt); const selectedChatId = chats.some((chat) => chat.chatId === requestedChatId) ? requestedChatId : chats[0]?.chatId; const chat = selectedChatId ? store.getChat(selectedChatId) : undefined; const messages = chat ? [...store.listTurns(chat.chatId).map((turn) => ({ role: "user" as const, content: turn.content, createdAt: turn.submittedAt })), ...store.listOutputs(chat.chatId).map((output) => ({ role: "assistant" as const, content: output.content, createdAt: output.createdAt }))].sort((left, right) => left.createdAt.localeCompare(right.createdAt)) : []; return { chats: chats.map((item, index) => ({ chatId: item.chatId, label: `Chat ${index + 1}`, trashed: Boolean(item.trashedAt), forked: Boolean(item.originChatId) })), selectedChatId, showingTrash, messages: messages.map(({ role, content }) => ({ role, content })) }; }
+function chatsView(state: ChatState): string { return `<section id="chats" class="view" data-active="false"><p class="eyebrow">Session-first conversations</p><div class="chat-heading"><div><h1>Chats</h1><p class="lede">Your messages and model responses are stored locally and rebuild after reload.</p></div><div class="chat-actions"><button data-chat-action="new" class="send" type="button">New chat</button><button data-chat-action="toggle-trash" class="quiet-action" type="button">${state.showingTrash ? "Back to chats" : "Trash"}</button></div></div><div class="chat-shell"><aside id="session-list" class="session-list">${renderSessions(state)}</aside><div class="chat-layout"><div id="chat-toolbar" class="chat-toolbar">${renderToolbar(state)}</div><div id="transcript" class="transcript">${renderMessages(state.messages)}</div><p id="chat-error" class="chat-error" role="status"></p><form id="chat-form" class="composer"><textarea id="chat-input" aria-label="Chat message" aria-multiline="true" rows="1" placeholder="Message Bridgit…"></textarea><button class="send" type="submit">Send</button></form></div></div></section>`; }
+function renderSessions(state: ChatState): string { return state.chats.map((chat) => `<button class="session-item" data-chat-action="select" data-chat-id="${chat.chatId}" aria-current="${String(chat.chatId === state.selectedChatId)}"><span>${chat.label}</span>${chat.forked ? "<small>Fork</small>" : ""}</button>`).join("") || `<p class="muted">${state.showingTrash ? "Trash is empty." : "No chats yet."}</p>`; }
+function renderToolbar(state: ChatState): string { if (!state.selectedChatId) return "<span class=\"muted\">Create a Chat to begin.</span>"; return state.showingTrash ? `<button data-chat-action="restore" class="quiet-action" type="button">Restore</button><button data-chat-action="delete" class="danger-action" type="button">Delete permanently</button>` : `<button data-chat-action="fork" class="quiet-action" type="button">Fork</button><button data-chat-action="trash" class="quiet-action" type="button">Move to Trash</button>`; }
+function renderMessages(messages: ChatState["messages"]): string { return messages.map((item) => `<div class="message ${item.role}"><strong>${item.role === "user" ? "you" : "Bridgit"}</strong><br>${escapeHtml(item.content)}</div>`).join("") || "<p class=\"muted\">Start a durable Chat session below.</p>"; }
 function escapeHtml(value: string): string { return value.replace(/[&<>\"]/g, (character) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[character] ?? character); }
 function isSendMessage(value: unknown): value is { type: "chat-send"; content: string } { return typeof value === "object" && value !== null && (value as { type?: unknown }).type === "chat-send" && typeof (value as { content?: unknown }).content === "string"; }
+function isChatAction(value: unknown): value is { type: "chat-action"; action: "new" | "toggle-trash" | "select" | "fork" | "trash" | "restore" | "delete"; chatId?: string } { return typeof value === "object" && value !== null && (value as { type?: unknown }).type === "chat-action" && ["new", "toggle-trash", "select", "fork", "trash", "restore", "delete"].includes(String((value as { action?: unknown }).action)); }
 
 function navigationButton(id: string, icon: string, label: string, active = false): string {
   return `<button class="nav-button" role="tab" aria-selected="${active}" data-target="${id}"><span class="nav-icon" aria-hidden="true">${icon}</span><span class="nav-label">${label}</span></button>`;

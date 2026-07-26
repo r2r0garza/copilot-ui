@@ -62,3 +62,9 @@ test("keeps lifecycle, forks, trash, summaries, ledger, and audits append-only",
   const fork = store.forkChat(chat.chatId, "bundled:orchestrator"); store.trashChat(chat.chatId); assert.equal(store.listChats().length, 1); assert.equal(store.listChats()[0]?.chatId, fork.chatId);
   store.restoreChat(chat.chatId); assert.equal(store.listChats().length, 2); store.close();
 });
+
+test("turns an abandoned active attempt into an interrupted, retryable record on host restart", () => {
+  const directory = mkdtempSync(join(tmpdir(), "bridgit-restart-"));
+  const writer = new WorkspaceStore(directory); const chat = writer.createChat("bundled:orchestrator", null); const turn = writer.submitTurn(chat.chatId, "Continue"); const attempt = writer.createResponseAttempt(turn.turnId, "model-a"); writer.transitionAttempt(attempt.attemptId, "running"); writer.close();
+  const reader = new WorkspaceStore(directory); assert.doesNotThrow(() => reader.createResponseAttempt(turn.turnId, "model-a")); reader.close();
+});
