@@ -13,6 +13,7 @@ try {
 } finally {
   const restoreStatus = run(["run", "rebuild:vscode"]);
   if (restoreStatus !== 0) status = restoreStatus;
+  else if (run(["run", "verify:vscode"]) !== 0) status = 1;
 }
 
 process.exitCode = status;

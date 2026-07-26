@@ -43,6 +43,7 @@
     "test:unit": "tsc -p tsconfig.test.json && find .tmp-test/test -name '*.test.js' -print0 | xargs -0 node --test",
     "rebuild:node": "npm rebuild better-sqlite3",
     "verify": "npm run check && npm run test:unit && npm run validate:spec",
+    "verify:vscode": "node scripts/verify-vscode-sqlite.mjs",
     "test": "node scripts/test.mjs",
     "rebuild:vscode": "electron-rebuild --version 42.6.0 --arch arm64 --only better-sqlite3",
     "prototype": "node prototype/workbench/server.mjs"
