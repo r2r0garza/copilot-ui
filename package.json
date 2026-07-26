@@ -18,7 +18,8 @@
   ],
   "main": "./out/extension.js",
   "activationEvents": [
-    "onCommand:bridgit.openWorkbench"
+    "onCommand:bridgit.openWorkbench",
+    "onView:bridgit.launcher"
   ],
   "contributes": {
     "viewsContainers": {
