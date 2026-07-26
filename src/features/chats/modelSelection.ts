@@ -1,0 +1,2 @@
+export interface ModelSelection { readonly effectiveModelId: string; readonly source: "requested" | "agent" | "auto"; }
+export function selectModel(requestedModelId: string | null | undefined, agentModelId: string | null | undefined, autoModelId: string): ModelSelection { if (requestedModelId) return { effectiveModelId: requestedModelId, source: "requested" }; if (agentModelId) return { effectiveModelId: agentModelId, source: "agent" }; return { effectiveModelId: autoModelId, source: "auto" }; }
