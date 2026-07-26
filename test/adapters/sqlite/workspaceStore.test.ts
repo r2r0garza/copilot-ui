@@ -11,11 +11,13 @@ test("durably pairs a submitted turn with an immutable artifact and event", () =
   const chat = store.createChat("bundled:orchestrator", "model-a", "2026-07-25T00:00:00.000Z");
   const turn = store.submitTurn(chat.chatId, "Hello, Bridgit.", "2026-07-25T00:00:01.000Z");
   const attempt = store.createResponseAttempt(turn.turnId, "model-a", "2026-07-25T00:00:02.000Z");
+  const output = store.appendOutput(turn.turnId, "Hello from the model.", "2026-07-25T00:00:03.000Z");
 
   assert.equal(store.getChat(chat.chatId)?.version, 2);
   assert.deepEqual(store.listTurns(chat.chatId), [turn]);
   assert.equal(attempt.state, "preparing");
-  assert.deepEqual(store.listEvents().map((event) => event.name), ["chat.session-created", "chat.turn-submitted", "response.preparation-started"]);
+  assert.equal(store.listOutputs(chat.chatId)[0]?.content, output.content);
+  assert.deepEqual(store.listEvents().map((event) => event.name), ["chat.session-created", "chat.turn-submitted", "response.preparation-started", "chat.output-appended"]);
   store.close();
 });
 

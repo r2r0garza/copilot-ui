@@ -1,5 +1,6 @@
 import * as vscode from "vscode";
 
+import { WorkspaceStore } from "../adapters/sqlite/workspaceStore";
 import type { Runtime } from "../runtime/createRuntime";
 
 const VIEW_TYPE = "bridgit.workbench";
@@ -15,12 +16,34 @@ export function createWorkbenchPanel(
     { enableScripts: true },
   );
 
-  panel.webview.html = renderWorkbench(panel.webview);
-  context.subscriptions.push(panel);
+  const store = new WorkspaceStore((context.storageUri ?? context.globalStorageUri).fsPath);
+  const sendState = (): Thenable<boolean> => panel.webview.postMessage({ type: "chat-state", state: chatState(store) });
+  panel.webview.html = renderWorkbench(panel.webview, chatState(store));
+  panel.webview.onDidReceiveMessage(async (message: unknown) => {
+    if (!isSendMessage(message)) return;
+    const content = message.content.trim();
+    if (!content) return;
+    try {
+      const chat = store.listChats()[0] ?? store.createChat("bundled:orchestrator", null);
+      const turn = store.submitTurn(chat.chatId, content);
+      const [model] = await vscode.lm.selectChatModels();
+      if (!model) throw new Error("No chat model is available. Sign in to GitHub Copilot and try again.");
+      store.createResponseAttempt(turn.turnId, model.id);
+      const cancellation = new vscode.CancellationTokenSource();
+      const response = await model.sendRequest([vscode.LanguageModelChatMessage.User(content)], {}, cancellation.token);
+      let output = "";
+      for await (const fragment of response.text) output += fragment;
+      store.appendOutput(turn.turnId, output || "The model returned no visible text.");
+      await sendState();
+    } catch (error) {
+      await panel.webview.postMessage({ type: "chat-error", message: error instanceof Error ? error.message : "Unable to send this Chat message." });
+    }
+  });
+  context.subscriptions.push(panel, { dispose: () => store.close() });
   return panel;
 }
 
-function renderWorkbench(webview: vscode.Webview): string {
+function renderWorkbench(webview: vscode.Webview, state: ChatState): string {
   const nonce = createNonce();
 
   return `<!doctype html>
@@ -66,6 +89,13 @@ function renderWorkbench(webview: vscode.Webview): string {
       .subtask { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 9px 0; border-bottom: 1px solid var(--vscode-panel-border); }
       .subtask:last-child { border-bottom: 0; }
       .subtask small { color: var(--vscode-descriptionForeground); }
+      .chat-layout { display: grid; gap: 16px; max-width: 800px; }
+      .transcript { min-height: 260px; display: grid; gap: 12px; padding: 18px; border: 1px solid var(--vscode-panel-border); background: var(--vscode-editorWidget-background); }
+      .message { padding: 11px 13px; border-left: 2px solid var(--vscode-focusBorder); background: var(--vscode-textBlockQuote-background); white-space: pre-wrap; line-height: 1.55; }
+      .message.assistant { border-left-color: var(--vscode-testing-iconPassed); }
+      .composer { display: grid; grid-template-columns: 1fr auto; gap: 10px; }
+      textarea { min-height: 76px; resize: vertical; padding: 10px; color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border); background: var(--vscode-input-background); font: inherit; }
+      .send { align-self: end; padding: 9px 14px; color: var(--vscode-button-foreground); border: 0; border-radius: 2px; background: var(--vscode-button-background); cursor: pointer; font-weight: 600; }
       @media (max-width: 700px) { .workbench { grid-template-columns: 58px minmax(0, 1fr); } .brand span, .nav-label, .rail-footer { display: none; } .brand { justify-content: center; margin-inline: 0; } .nav-button { justify-content: center; padding-inline: 4px; } .board { grid-template-columns: 1fr; } .card--wide { grid-column: auto; } .content { padding: 24px 18px; } }
     </style>
   </head>
@@ -85,7 +115,7 @@ function renderWorkbench(webview: vscode.Webview): string {
       </aside>
       <section class="content">
         ${tasksView()}
-        ${emptyView("chats", "Chats", "Session-first conversations", "Create a session to begin a durable, model-backed conversation. Sessions, turns, and response attempts will appear here.")}
+        ${chatsView(state)}
         ${emptyView("activity", "Activity", "Meaningful outcomes", "Recovery notices, approvals, and execution outcomes will form a concise chronological record here.")}
         ${emptyView("agents", "Agents", "Repository and bundled agents", "Discovered agents, eligibility, model preferences, and their available resources will appear here.")}
         ${emptyView("memory", "Memory", "Explicit, inspectable memory", "Project and Personal Memory stay separate from session-local ledgers and require explicit confirmation.")}
@@ -100,10 +130,19 @@ function renderWorkbench(webview: vscode.Webview): string {
         for (const candidate of buttons) candidate.setAttribute('aria-selected', String(candidate === button));
         for (const view of views) view.dataset.active = String(view.id === target);
       });
+      const vscode = acquireVsCodeApi(); const form = document.querySelector('#chat-form'); const input = document.querySelector('#chat-input'); const transcript = document.querySelector('#transcript');
+      form?.addEventListener('submit', (event) => { event.preventDefault(); const content = input.value; if (content.trim()) { vscode.postMessage({ type: 'chat-send', content }); input.value = ''; } });
+      window.addEventListener('message', (event) => { const message = event.data; if (message.type === 'chat-state') transcript.innerHTML = message.state.messages.map((item) => '<div class="message ' + item.role + '"><strong>' + item.role + '</strong><br>' + item.content + '</div>').join('') || '<p class="muted">Start a durable Chat session below.</p>'; if (message.type === 'chat-error') alert(message.message); });
     </script>
   </body>
 </html>`;
 }
+
+interface ChatState { readonly messages: readonly { readonly role: "user" | "assistant"; readonly content: string }[]; }
+function chatState(store: WorkspaceStore): ChatState { const chat = store.listChats()[0]; if (!chat) return { messages: [] }; const messages: ChatState["messages"] = [...store.listTurns(chat.chatId).map((turn) => ({ role: "user" as const, content: turn.content })), ...store.listOutputs(chat.chatId).map((output) => ({ role: "assistant" as const, content: output.content }))]; return { messages }; }
+function chatsView(state: ChatState): string { return `<section id="chats" class="view" data-active="false"><p class="eyebrow">Session-first conversations</p><h1>Chats</h1><p class="lede">Your messages and model responses are stored locally and rebuild after reload.</p><div class="chat-layout"><div id="transcript" class="transcript">${state.messages.map((item) => `<div class="message ${item.role}"><strong>${item.role}</strong><br>${escapeHtml(item.content)}</div>`).join("") || "<p>Start a durable Chat session below.</p>"}</div><form id="chat-form" class="composer"><textarea id="chat-input" aria-label="Chat message" placeholder="Message Bridgit…"></textarea><button class="send" type="submit">Send</button></form></div></section>`; }
+function escapeHtml(value: string): string { return value.replace(/[&<>\"]/g, (character) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[character] ?? character); }
+function isSendMessage(value: unknown): value is { type: "chat-send"; content: string } { return typeof value === "object" && value !== null && (value as { type?: unknown }).type === "chat-send" && typeof (value as { content?: unknown }).content === "string"; }
 
 function navigationButton(id: string, icon: string, label: string, active = false): string {
   return `<button class="nav-button" role="tab" aria-selected="${active}" data-target="${id}"><span class="nav-icon" aria-hidden="true">${icon}</span><span class="nav-label">${label}</span></button>`;
