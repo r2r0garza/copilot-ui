@@ -5,6 +5,7 @@
       "name": "Run Bridgit Extension",
       "type": "extensionHost",
       "request": "launch",
+      "preLaunchTask": "prepare Bridgit Extension",
       "args": [
         "--extensionDevelopmentPath=${workspaceFolder}"
       ],

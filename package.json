@@ -43,6 +43,7 @@
     "validate:spec": "node scripts/validate-spec.mjs",
     "test:unit": "tsc -p tsconfig.test.json && find .tmp-test/test -name '*.test.js' -print0 | xargs -0 node --test",
     "rebuild:node": "pnpm rebuild better-sqlite3",
+    "prepare:vscode": "pnpm run rebuild:vscode && pnpm run verify:vscode && pnpm run compile",
     "verify": "pnpm run check && pnpm run test:unit && pnpm run validate:spec",
     "verify:vscode": "node scripts/verify-vscode-sqlite.mjs",
     "test": "node scripts/test.mjs",
