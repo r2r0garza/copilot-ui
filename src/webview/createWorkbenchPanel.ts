@@ -16,30 +16,32 @@ export function createWorkbenchPanel(
     { enableScripts: true },
   );
 
-  const store = new WorkspaceStore((context.storageUri ?? context.globalStorageUri).fsPath);
-  const sendState = (): Thenable<boolean> => panel.webview.postMessage({ type: "chat-state", state: chatState(store) });
-  panel.webview.html = renderWorkbench(panel.webview, chatState(store));
+  let store: WorkspaceStore | undefined;
+  const getStore = (): WorkspaceStore => store ??= new WorkspaceStore((context.storageUri ?? context.globalStorageUri).fsPath);
+  const sendState = (): Thenable<boolean> => panel.webview.postMessage({ type: "chat-state", state: chatState(getStore()) });
+  panel.webview.html = renderWorkbench(panel.webview, { messages: [] });
   panel.webview.onDidReceiveMessage(async (message: unknown) => {
     if (!isSendMessage(message)) return;
     const content = message.content.trim();
     if (!content) return;
     try {
-      const chat = store.listChats()[0] ?? store.createChat("bundled:orchestrator", null);
-      const turn = store.submitTurn(chat.chatId, content);
+      const authority = getStore();
+      const chat = authority.listChats()[0] ?? authority.createChat("bundled:orchestrator", null);
+      const turn = authority.submitTurn(chat.chatId, content);
       const [model] = await vscode.lm.selectChatModels();
       if (!model) throw new Error("No chat model is available. Sign in to GitHub Copilot and try again.");
-      store.createResponseAttempt(turn.turnId, model.id);
+      authority.createResponseAttempt(turn.turnId, model.id);
       const cancellation = new vscode.CancellationTokenSource();
       const response = await model.sendRequest([vscode.LanguageModelChatMessage.User(content)], {}, cancellation.token);
       let output = "";
       for await (const fragment of response.text) output += fragment;
-      store.appendOutput(turn.turnId, output || "The model returned no visible text.");
+      authority.appendOutput(turn.turnId, output || "The model returned no visible text.");
       await sendState();
     } catch (error) {
       await panel.webview.postMessage({ type: "chat-error", message: error instanceof Error ? error.message : "Unable to send this Chat message." });
     }
   });
-  context.subscriptions.push(panel, { dispose: () => store.close() });
+  context.subscriptions.push(panel, { dispose: () => store?.close() });
   return panel;
 }
 
