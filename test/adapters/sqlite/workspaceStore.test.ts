@@ -3,6 +3,7 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import Database from "better-sqlite3";
 
 import { WorkspaceStore } from "../../../src/adapters/sqlite/workspaceStore";
 
@@ -68,6 +69,12 @@ test("permanent deletion preserves surviving forks without their deleted-origin 
   const store = new WorkspaceStore(mkdtempSync(join(tmpdir(), "bridgit-fork-delete-")));
   const source = store.createChat("bundled:orchestrator", null); const fork = store.forkChat(source.chatId, "bundled:orchestrator"); store.trashChat(source.chatId); store.deleteChatPermanently(source.chatId, true);
   assert.equal(store.getChat(source.chatId), undefined); assert.equal(store.getChat(fork.chatId)?.originChatId, null); store.close();
+});
+
+test("permanent deletion supports legacy databases whose Chat foreign keys do not cascade", () => {
+  const directory = mkdtempSync(join(tmpdir(), "bridgit-legacy-delete-")); const database = new Database(join(directory, "bridgit.sqlite"));
+  database.exec("PRAGMA foreign_keys = ON; CREATE TABLE artifacts (artifact_id TEXT PRIMARY KEY, media_type TEXT NOT NULL, byte_count INTEGER NOT NULL, checksum TEXT NOT NULL, display_label TEXT NOT NULL, content TEXT NOT NULL); CREATE TABLE chat_sessions (chat_id TEXT PRIMARY KEY, version INTEGER NOT NULL, agent_identity TEXT NOT NULL, requested_model_id TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, origin_chat_id TEXT, trashed_at TEXT); CREATE TABLE chat_turns (turn_id TEXT PRIMARY KEY, chat_id TEXT NOT NULL REFERENCES chat_sessions(chat_id), ordinal INTEGER NOT NULL, content_artifact_id TEXT NOT NULL REFERENCES artifacts(artifact_id), submitted_at TEXT NOT NULL, UNIQUE(chat_id, ordinal)); CREATE TABLE response_attempts (attempt_id TEXT PRIMARY KEY, turn_id TEXT NOT NULL REFERENCES chat_turns(turn_id), ordinal INTEGER NOT NULL, state TEXT NOT NULL, requested_model_id TEXT, created_at TEXT NOT NULL, effective_model_id TEXT, snapshot_id TEXT, ended_at TEXT, UNIQUE(turn_id, ordinal)); CREATE TABLE chat_outputs (output_id TEXT PRIMARY KEY, turn_id TEXT NOT NULL REFERENCES chat_turns(turn_id), artifact_id TEXT NOT NULL REFERENCES artifacts(artifact_id), created_at TEXT NOT NULL); INSERT INTO artifacts VALUES ('user-artifact','text/plain',4,'hash','Turn','test'), ('output-artifact','text/plain',4,'hash','Output','done'); INSERT INTO chat_sessions VALUES ('legacy-chat',1,'bundled:orchestrator',NULL,'2026-07-25T00:00:00.000Z','2026-07-25T00:00:00.000Z',NULL,'2026-07-25T00:01:00.000Z'); INSERT INTO chat_turns VALUES ('legacy-turn','legacy-chat',1,'user-artifact','2026-07-25T00:00:01.000Z'); INSERT INTO response_attempts VALUES ('legacy-attempt','legacy-turn',1,'succeeded',NULL,'2026-07-25T00:00:02.000Z',NULL,NULL,'2026-07-25T00:00:03.000Z'); INSERT INTO chat_outputs VALUES ('legacy-output','legacy-turn','output-artifact','2026-07-25T00:00:03.000Z');");
+  database.close(); const store = new WorkspaceStore(directory); assert.doesNotThrow(() => store.deleteChatPermanently("legacy-chat", true)); assert.equal(store.getChat("legacy-chat"), undefined); store.close();
 });
 
 test("turns an abandoned active attempt into an interrupted, retryable record on host restart", () => {
