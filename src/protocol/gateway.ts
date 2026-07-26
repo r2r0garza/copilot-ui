@@ -10,6 +10,7 @@ export interface ProtocolGatewayOptions { readonly webviewInstanceId: string; re
 export class ProtocolGateway {
   private bound = false;
   private readonly requestFingerprints = new Map<string, string>();
+  private readonly acceptedResults = new Map<string, unknown>();
 
   public constructor(private readonly options: ProtocolGatewayOptions) {}
 
@@ -30,6 +31,10 @@ export class ProtocolGateway {
     this.requestFingerprints.set(parsed.value.requestId, fingerprint);
     return parsed.value;
   }
+
+  public rememberAccepted(operationId: string, result: unknown): unknown { const prior = this.acceptedResults.get(operationId); if (prior !== undefined) return prior; this.acceptedResults.set(operationId, result); return result; }
+
+  public snapshot(): GatewayResponse | AuthoritativeSnapshot { return this.bound ? this.options.snapshot() : { kind: "result", outcome: "rejected", code: "webview-unbound", requestId: null }; }
 
   private acceptHello(hello: ProtocolHello): GatewayResponse {
     if (hello.webviewInstanceId !== this.options.webviewInstanceId || hello.bootstrapNonce !== this.options.bootstrapNonce) return { kind: "protocol.reload-required", reason: "instance-superseded" };
