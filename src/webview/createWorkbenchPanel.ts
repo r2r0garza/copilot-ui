@@ -60,10 +60,10 @@ function renderWorkbench(webview: vscode.Webview, state: ChatState): string {
     <style>
       :root { color-scheme: light dark; }
       * { box-sizing: border-box; }
-      body { margin: 0; color: var(--vscode-foreground); background: var(--vscode-editor-background); font: var(--vscode-font-weight) var(--vscode-font-size) var(--vscode-font-family); }
+      body { height: 100vh; margin: 0; overflow: hidden; color: var(--vscode-foreground); background: var(--vscode-editor-background); font: var(--vscode-font-weight) var(--vscode-font-size) var(--vscode-font-family); }
       button { color: inherit; font: inherit; }
-      .workbench { min-height: 100vh; display: grid; grid-template-columns: 188px minmax(0, 1fr); }
-      .rail { padding: 18px 10px; border-right: 1px solid var(--vscode-panel-border); background: var(--vscode-sideBar-background); }
+      .workbench { height: 100vh; display: grid; grid-template-columns: 188px minmax(0, 1fr); overflow: hidden; }
+      .rail { height: 100vh; padding: 18px 10px; overflow-y: auto; border-right: 1px solid var(--vscode-panel-border); background: var(--vscode-sideBar-background); }
       .brand { display: flex; gap: 9px; align-items: center; margin: 3px 10px 26px; font-weight: 700; letter-spacing: .02em; }
       .brand-mark { width: 20px; height: 20px; display: grid; place-items: center; border: 1px solid var(--vscode-focusBorder); color: var(--vscode-focusBorder); font-size: 12px; }
       .navigation { display: grid; gap: 3px; }
@@ -73,7 +73,7 @@ function renderWorkbench(webview: vscode.Webview, state: ChatState): string {
       .nav-icon { width: 16px; color: var(--vscode-descriptionForeground); text-align: center; }
       .nav-button[aria-selected="true"] .nav-icon { color: inherit; }
       .rail-footer { margin: 28px 10px 0; padding-top: 16px; border-top: 1px solid var(--vscode-panel-border); color: var(--vscode-descriptionForeground); font-size: 11px; line-height: 1.5; }
-      .content { min-width: 0; padding: clamp(22px, 4vw, 54px); }
+      .content { min-width: 0; height: 100vh; overflow: hidden; padding: clamp(22px, 4vw, 54px); }
       .view { display: none; max-width: 1180px; margin: 0 auto; }
       .view[data-active="true"] { display: block; }
       .eyebrow { margin: 0 0 8px; color: var(--vscode-descriptionForeground); font-size: 11px; font-weight: 700; letter-spacing: .11em; text-transform: uppercase; }
@@ -94,7 +94,7 @@ function renderWorkbench(webview: vscode.Webview, state: ChatState): string {
       .subtask:last-child { border-bottom: 0; }
       .subtask small { color: var(--vscode-descriptionForeground); }
       .chat-layout { display: flex; flex-direction: column; gap: 16px; max-width: 800px; }
-      .transcript { min-height: 260px; display: flex; flex: 1; flex-direction: column; align-items: flex-start; gap: 12px; padding: 18px; overflow-y: auto; border: 1px solid var(--vscode-panel-border); background: var(--vscode-editorWidget-background); }
+      .transcript { min-height: 0; display: flex; flex: 1; flex-direction: column; align-items: flex-start; gap: 12px; padding: 18px; overflow-y: auto; border: 1px solid var(--vscode-panel-border); background: var(--vscode-editorWidget-background); }
       .message { width: fit-content; max-width: min(78%, 620px); padding: 10px 13px; border-radius: 5px; border-left: 2px solid var(--vscode-testing-iconPassed); background: var(--vscode-textBlockQuote-background); white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.55; }
       .message.user { align-self: flex-end; border-left: 0; border-right: 2px solid var(--vscode-focusBorder); background: var(--vscode-input-background); }
       .message.assistant { align-self: flex-start; }
@@ -103,8 +103,8 @@ function renderWorkbench(webview: vscode.Webview, state: ChatState): string {
       textarea { min-height: 42px; max-height: 322px; resize: none; overflow-y: hidden; padding: 10px; color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border); border-radius: 4px; background: var(--vscode-input-background); font: inherit; line-height: 21px; }
       textarea:focus { outline: 1px solid var(--vscode-focusBorder); outline-offset: -1px; }
       .send { align-self: end; padding: 9px 14px; color: var(--vscode-button-foreground); border: 0; border-radius: 2px; background: var(--vscode-button-background); cursor: pointer; font-weight: 600; }
-      .view#chats { max-width: none; min-height: calc(100vh - 108px); }
-      .chat-layout { width: min(100%, 1280px); max-width: none; min-height: calc(100vh - 240px); }
+      .view#chats { max-width: none; height: calc(100vh - 108px); min-height: 0; }
+      .chat-layout { width: min(100%, 1280px); max-width: none; height: calc(100vh - 240px); min-height: 0; }
       .composer { position: sticky; bottom: 0; padding-top: 10px; background: var(--vscode-editor-background); }
       @media (max-width: 700px) { .workbench { grid-template-columns: 58px minmax(0, 1fr); } .brand span, .nav-label, .rail-footer { display: none; } .brand { justify-content: center; margin-inline: 0; } .nav-button { justify-content: center; padding-inline: 4px; } .board { grid-template-columns: 1fr; } .card--wide { grid-column: auto; } .content { padding: 24px 18px; } }
     </style>
@@ -140,12 +140,12 @@ function renderWorkbench(webview: vscode.Webview, state: ChatState): string {
         for (const candidate of buttons) candidate.setAttribute('aria-selected', String(candidate === button));
         for (const view of views) view.dataset.active = String(view.id === target);
       });
-      const vscode = acquireVsCodeApi(); const form = document.querySelector('#chat-form'); const input = document.querySelector('#chat-input'); const transcript = document.querySelector('#transcript'); const error = document.querySelector('#chat-error');
+      const vscode = acquireVsCodeApi(); const form = document.querySelector('#chat-form'); const input = document.querySelector('#chat-input'); const transcript = document.querySelector('#transcript'); const error = document.querySelector('#chat-error'); const scrollToLatest = () => { transcript.scrollTop = transcript.scrollHeight; };
       const resizeComposer = () => { input.style.height = 'auto'; input.style.height = Math.min(input.scrollHeight, 322) + 'px'; input.style.overflowY = input.scrollHeight > 322 ? 'auto' : 'hidden'; };
       input?.addEventListener('input', resizeComposer);
       input?.addEventListener('keydown', (event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); form?.requestSubmit(); } });
-      form?.addEventListener('submit', (event) => { event.preventDefault(); const content = input.value; if (content.trim()) { transcript.innerHTML += '<div class="message user"><strong>you</strong><br>' + content.replace(/[&<>]/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])) + '</div><div id="streaming-response" class="message assistant"><strong>Bridgit</strong><br><span></span></div>'; error.textContent = 'Sending…'; vscode.postMessage({ type: 'chat-send', content }); input.value = ''; resizeComposer(); } });
-      window.addEventListener('message', (event) => { const message = event.data; if (message.type === 'chat-state') { transcript.innerHTML = message.state.messages.map((item) => '<div class="message ' + item.role + '"><strong>' + (item.role === 'user' ? 'you' : 'Bridgit') + '</strong><br>' + item.content + '</div>').join('') || '<p class="muted">Start a durable Chat session below.</p>'; error.textContent = ''; } if (message.type === 'chat-stream') { const stream = document.querySelector('#streaming-response span'); if (stream) stream.textContent = message.content; } if (message.type === 'chat-error') error.textContent = message.message; });
+      form?.addEventListener('submit', (event) => { event.preventDefault(); const content = input.value; if (content.trim()) { transcript.innerHTML += '<div class="message user"><strong>you</strong><br>' + content.replace(/[&<>]/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])) + '</div><div id="streaming-response" class="message assistant"><strong>Bridgit</strong><br><span></span></div>'; scrollToLatest(); error.textContent = 'Sending…'; vscode.postMessage({ type: 'chat-send', content }); input.value = ''; resizeComposer(); } });
+      window.addEventListener('message', (event) => { const message = event.data; if (message.type === 'chat-state') { transcript.innerHTML = message.state.messages.map((item) => '<div class="message ' + item.role + '"><strong>' + (item.role === 'user' ? 'you' : 'Bridgit') + '</strong><br>' + item.content + '</div>').join('') || '<p class="muted">Start a durable Chat session below.</p>'; scrollToLatest(); error.textContent = ''; } if (message.type === 'chat-stream') { const stream = document.querySelector('#streaming-response span'); if (stream) { stream.textContent = message.content; scrollToLatest(); } } if (message.type === 'chat-error') error.textContent = message.message; }); requestAnimationFrame(scrollToLatest);
     </script>
   </body>
 </html>`;
