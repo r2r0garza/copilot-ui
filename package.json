@@ -47,7 +47,7 @@
     "verify": "pnpm run check && pnpm run test:unit && pnpm run validate:spec",
     "verify:vscode": "node scripts/verify-vscode-sqlite.mjs",
     "test": "node scripts/test.mjs",
-    "rebuild:vscode": "electron-rebuild --version 42.6.0 --arch arm64 --only better-sqlite3",
+    "rebuild:vscode": "electron-rebuild --version 42.6.0 --arch arm64 --only better-sqlite3 --force --build-from-source",
     "prototype": "node prototype/workbench/server.mjs"
   },
   "dependencies": {
