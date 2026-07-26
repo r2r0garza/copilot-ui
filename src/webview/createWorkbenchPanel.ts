@@ -36,7 +36,7 @@ export function createWorkbenchPanel(
       const cancellation = new vscode.CancellationTokenSource();
       const response = await model.sendRequest([vscode.LanguageModelChatMessage.User(content)], {}, cancellation.token);
       let output = "";
-      for await (const fragment of response.text) { output += fragment; await panel.webview.postMessage({ type: "chat-stream", content: output }); }
+      for await (const fragment of response.text) { output += fragment; authority.checkpointOutput(turn.turnId, output); await panel.webview.postMessage({ type: "chat-stream", content: output }); }
       authority.appendOutput(turn.turnId, output || "The model returned no visible text.");
       await sendState();
     } catch (error) {

@@ -33,3 +33,18 @@ test("reconstructs the authoritative Chat after reopening workspace storage", ()
   assert.deepEqual(reader.listEvents().map((event) => event.name), ["chat.session-created", "chat.turn-submitted"]);
   reader.close();
 });
+
+test("restores an interrupted streamed response and replaces it with its immutable final output", () => {
+  const directory = mkdtempSync(join(tmpdir(), "bridgit-stream-"));
+  const writer = new WorkspaceStore(directory);
+  const chat = writer.createChat("bundled:orchestrator", null, "2026-07-25T00:00:00.000Z");
+  const turn = writer.submitTurn(chat.chatId, "Keep this response.", "2026-07-25T00:00:01.000Z");
+  writer.checkpointOutput(turn.turnId, "Partial response", "2026-07-25T00:00:02.000Z");
+  writer.close();
+
+  const reader = new WorkspaceStore(directory);
+  assert.equal(reader.listOutputs(chat.chatId)[0]?.content, "Partial response");
+  reader.appendOutput(turn.turnId, "Complete response", "2026-07-25T00:00:03.000Z");
+  assert.deepEqual(reader.listOutputs(chat.chatId).map((output) => output.content), ["Complete response"]);
+  reader.close();
+});
