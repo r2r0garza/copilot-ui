@@ -33,17 +33,19 @@
     "compile": "tsc -p ./",
     "check": "tsc -p ./ --noEmit",
     "validate:spec": "node scripts/validate-spec.mjs",
-    "test:unit": "tsc -p tsconfig.test.json && node --test .tmp-test/test/**/*.test.js",
+    "test:unit": "tsc -p tsconfig.test.json && find .tmp-test/test -name '*.test.js' -print0 | xargs -0 node --test",
     "test": "npm run check && npm run test:unit && npm run validate:spec",
     "prototype": "node prototype/workbench/server.mjs"
   },
+  "dependencies": {
+    "ajv": "^8.17.1",
+    "ajv-formats": "^3.0.1",
+    "better-sqlite3": "^12.6.2"
+  },
   "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^22.15.3",
     "@types/vscode": "^1.125.0",
     "typescript": "^5.8.3"
-  },
-  "dependencies": {
-    "ajv": "^8.17.1",
-    "ajv-formats": "^3.0.1"
   }
 }
