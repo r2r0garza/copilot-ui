@@ -26,7 +26,7 @@
       "activitybar": [{ "id": "bridgit", "title": "Bridgit", "icon": "$(hubot)" }]
     },
     "views": {
-      "bridgit": [{ "id": "bridgit.launcher", "name": "Bridgit" }]
+      "bridgit": [{ "id": "bridgit.launcher", "name": "Bridgit", "type": "webview" }]
     },
     "commands": [
       {
