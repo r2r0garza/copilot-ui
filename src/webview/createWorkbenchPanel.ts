@@ -92,10 +92,10 @@ function renderWorkbench(webview: vscode.Webview, state: ChatState): string {
       .subtask:last-child { border-bottom: 0; }
       .subtask small { color: var(--vscode-descriptionForeground); }
       .chat-layout { display: grid; gap: 16px; max-width: 800px; }
-      .transcript { min-height: 260px; display: grid; gap: 12px; padding: 18px; border: 1px solid var(--vscode-panel-border); background: var(--vscode-editorWidget-background); }
-      .message { max-width: min(78%, 620px); padding: 10px 13px; border-radius: 5px; border-left: 2px solid var(--vscode-testing-iconPassed); background: var(--vscode-textBlockQuote-background); white-space: pre-wrap; line-height: 1.55; }
-      .message.user { justify-self: end; border-left: 0; border-right: 2px solid var(--vscode-focusBorder); background: var(--vscode-input-background); }
-      .message.assistant { justify-self: start; }
+      .transcript { min-height: 260px; display: flex; flex-direction: column; align-items: flex-start; gap: 12px; padding: 18px; border: 1px solid var(--vscode-panel-border); background: var(--vscode-editorWidget-background); }
+      .message { width: fit-content; max-width: min(78%, 620px); padding: 10px 13px; border-radius: 5px; border-left: 2px solid var(--vscode-testing-iconPassed); background: var(--vscode-textBlockQuote-background); white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.55; }
+      .message.user { align-self: flex-end; border-left: 0; border-right: 2px solid var(--vscode-focusBorder); background: var(--vscode-input-background); }
+      .message.assistant { align-self: flex-start; }
       .composer { display: grid; grid-template-columns: 1fr auto; gap: 10px; }
       .chat-error { min-height: 18px; margin: 0; color: var(--vscode-errorForeground); font-size: 12px; }
       textarea { min-height: 42px; max-height: 322px; resize: none; overflow-y: hidden; padding: 10px; color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border); border-radius: 4px; background: var(--vscode-input-background); font: inherit; line-height: 21px; }
