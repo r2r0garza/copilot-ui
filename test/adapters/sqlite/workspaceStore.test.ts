@@ -18,3 +18,16 @@ test("durably pairs a submitted turn with an immutable artifact and event", () =
   assert.deepEqual(store.listEvents().map((event) => event.name), ["chat.session-created", "chat.turn-submitted", "response.preparation-started"]);
   store.close();
 });
+
+test("reconstructs the authoritative Chat after reopening workspace storage", () => {
+  const directory = mkdtempSync(join(tmpdir(), "bridgit-reload-"));
+  const writer = new WorkspaceStore(directory);
+  const chat = writer.createChat("bundled:orchestrator", null, "2026-07-25T00:00:00.000Z");
+  writer.submitTurn(chat.chatId, "Recover me.", "2026-07-25T00:00:01.000Z");
+  writer.close();
+  const reader = new WorkspaceStore(directory);
+  assert.equal(reader.listChats()[0]?.chatId, chat.chatId);
+  assert.equal(reader.listTurns(chat.chatId)[0]?.content, "Recover me.");
+  assert.deepEqual(reader.listEvents().map((event) => event.name), ["chat.session-created", "chat.turn-submitted"]);
+  reader.close();
+});
