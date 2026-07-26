@@ -93,11 +93,13 @@ function renderWorkbench(webview: vscode.Webview, state: ChatState): string {
       .subtask small { color: var(--vscode-descriptionForeground); }
       .chat-layout { display: grid; gap: 16px; max-width: 800px; }
       .transcript { min-height: 260px; display: grid; gap: 12px; padding: 18px; border: 1px solid var(--vscode-panel-border); background: var(--vscode-editorWidget-background); }
-      .message { padding: 11px 13px; border-left: 2px solid var(--vscode-focusBorder); background: var(--vscode-textBlockQuote-background); white-space: pre-wrap; line-height: 1.55; }
-      .message.assistant { border-left-color: var(--vscode-testing-iconPassed); }
+      .message { max-width: min(78%, 620px); padding: 10px 13px; border-radius: 5px; border-left: 2px solid var(--vscode-testing-iconPassed); background: var(--vscode-textBlockQuote-background); white-space: pre-wrap; line-height: 1.55; }
+      .message.user { justify-self: end; border-left: 0; border-right: 2px solid var(--vscode-focusBorder); background: var(--vscode-input-background); }
+      .message.assistant { justify-self: start; }
       .composer { display: grid; grid-template-columns: 1fr auto; gap: 10px; }
       .chat-error { min-height: 18px; margin: 0; color: var(--vscode-errorForeground); font-size: 12px; }
-      textarea { min-height: 76px; resize: vertical; padding: 10px; color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border); background: var(--vscode-input-background); font: inherit; }
+      textarea { min-height: 42px; max-height: 322px; resize: none; overflow-y: hidden; padding: 10px; color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border); border-radius: 4px; background: var(--vscode-input-background); font: inherit; line-height: 21px; }
+      textarea:focus { outline: 1px solid var(--vscode-focusBorder); outline-offset: -1px; }
       .send { align-self: end; padding: 9px 14px; color: var(--vscode-button-foreground); border: 0; border-radius: 2px; background: var(--vscode-button-background); cursor: pointer; font-weight: 600; }
       @media (max-width: 700px) { .workbench { grid-template-columns: 58px minmax(0, 1fr); } .brand span, .nav-label, .rail-footer { display: none; } .brand { justify-content: center; margin-inline: 0; } .nav-button { justify-content: center; padding-inline: 4px; } .board { grid-template-columns: 1fr; } .card--wide { grid-column: auto; } .content { padding: 24px 18px; } }
     </style>
@@ -134,7 +136,10 @@ function renderWorkbench(webview: vscode.Webview, state: ChatState): string {
         for (const view of views) view.dataset.active = String(view.id === target);
       });
       const vscode = acquireVsCodeApi(); const form = document.querySelector('#chat-form'); const input = document.querySelector('#chat-input'); const transcript = document.querySelector('#transcript'); const error = document.querySelector('#chat-error');
-      form?.addEventListener('submit', (event) => { event.preventDefault(); const content = input.value; if (content.trim()) { transcript.innerHTML += '<div class="message user"><strong>user</strong><br>' + content.replace(/[&<>]/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])) + '</div>'; error.textContent = 'Sending…'; vscode.postMessage({ type: 'chat-send', content }); input.value = ''; } });
+      const resizeComposer = () => { input.style.height = 'auto'; input.style.height = Math.min(input.scrollHeight, 322) + 'px'; input.style.overflowY = input.scrollHeight > 322 ? 'auto' : 'hidden'; };
+      input?.addEventListener('input', resizeComposer);
+      input?.addEventListener('keydown', (event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); form?.requestSubmit(); } });
+      form?.addEventListener('submit', (event) => { event.preventDefault(); const content = input.value; if (content.trim()) { transcript.innerHTML += '<div class="message user"><strong>you</strong><br>' + content.replace(/[&<>]/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])) + '</div>'; error.textContent = 'Sending…'; vscode.postMessage({ type: 'chat-send', content }); input.value = ''; resizeComposer(); } });
       window.addEventListener('message', (event) => { const message = event.data; if (message.type === 'chat-state') { transcript.innerHTML = message.state.messages.map((item) => '<div class="message ' + item.role + '"><strong>' + item.role + '</strong><br>' + item.content + '</div>').join('') || '<p class="muted">Start a durable Chat session below.</p>'; error.textContent = ''; } if (message.type === 'chat-error') error.textContent = message.message; });
     </script>
   </body>
@@ -143,7 +148,7 @@ function renderWorkbench(webview: vscode.Webview, state: ChatState): string {
 
 interface ChatState { readonly messages: readonly { readonly role: "user" | "assistant"; readonly content: string }[]; }
 function chatState(store: WorkspaceStore): ChatState { const chat = store.listChats()[0]; if (!chat) return { messages: [] }; const messages: ChatState["messages"] = [...store.listTurns(chat.chatId).map((turn) => ({ role: "user" as const, content: turn.content })), ...store.listOutputs(chat.chatId).map((output) => ({ role: "assistant" as const, content: output.content }))]; return { messages }; }
-function chatsView(state: ChatState): string { return `<section id="chats" class="view" data-active="false"><p class="eyebrow">Session-first conversations</p><h1>Chats</h1><p class="lede">Your messages and model responses are stored locally and rebuild after reload.</p><div class="chat-layout"><div id="transcript" class="transcript">${state.messages.map((item) => `<div class="message ${item.role}"><strong>${item.role}</strong><br>${escapeHtml(item.content)}</div>`).join("") || "<p>Start a durable Chat session below.</p>"}</div><p id="chat-error" class="chat-error" role="status"></p><form id="chat-form" class="composer"><textarea id="chat-input" aria-label="Chat message" placeholder="Message Bridgit…"></textarea><button class="send" type="submit">Send</button></form></div></section>`; }
+function chatsView(state: ChatState): string { return `<section id="chats" class="view" data-active="false"><p class="eyebrow">Session-first conversations</p><h1>Chats</h1><p class="lede">Your messages and model responses are stored locally and rebuild after reload.</p><div class="chat-layout"><div id="transcript" class="transcript">${state.messages.map((item) => `<div class="message ${item.role}"><strong>${item.role === "user" ? "you" : "Bridgit"}</strong><br>${escapeHtml(item.content)}</div>`).join("") || "<p>Start a durable Chat session below.</p>"}</div><p id="chat-error" class="chat-error" role="status"></p><form id="chat-form" class="composer"><textarea id="chat-input" aria-label="Chat message" aria-multiline="true" rows="1" placeholder="Message Bridgit…"></textarea><button class="send" type="submit">Send</button></form></div></section>`; }
 function escapeHtml(value: string): string { return value.replace(/[&<>\"]/g, (character) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[character] ?? character); }
 function isSendMessage(value: unknown): value is { type: "chat-send"; content: string } { return typeof value === "object" && value !== null && (value as { type?: unknown }).type === "chat-send" && typeof (value as { content?: unknown }).content === "string"; }
 
