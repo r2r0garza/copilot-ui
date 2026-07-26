@@ -19,7 +19,9 @@ export function createWorkbenchPanel(
   let store: WorkspaceStore | undefined;
   const getStore = (): WorkspaceStore => store ??= new WorkspaceStore((context.storageUri ?? context.globalStorageUri).fsPath);
   const sendState = (): Thenable<boolean> => panel.webview.postMessage({ type: "chat-state", state: chatState(getStore()) });
-  panel.webview.html = renderWorkbench(panel.webview, { messages: [] });
+  let initialState: ChatState = { messages: [] };
+  try { initialState = chatState(getStore()); } catch { /* The panel remains usable and surfaces storage errors on Send. */ }
+  panel.webview.html = renderWorkbench(panel.webview, initialState);
   panel.webview.onDidReceiveMessage(async (message: unknown) => {
     if (!isSendMessage(message)) return;
     const content = message.content.trim();
@@ -91,8 +93,8 @@ function renderWorkbench(webview: vscode.Webview, state: ChatState): string {
       .subtask { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 9px 0; border-bottom: 1px solid var(--vscode-panel-border); }
       .subtask:last-child { border-bottom: 0; }
       .subtask small { color: var(--vscode-descriptionForeground); }
-      .chat-layout { display: grid; gap: 16px; max-width: 800px; }
-      .transcript { min-height: 260px; display: flex; flex-direction: column; align-items: flex-start; gap: 12px; padding: 18px; border: 1px solid var(--vscode-panel-border); background: var(--vscode-editorWidget-background); }
+      .chat-layout { display: flex; flex-direction: column; gap: 16px; max-width: 800px; }
+      .transcript { min-height: 260px; display: flex; flex: 1; flex-direction: column; align-items: flex-start; gap: 12px; padding: 18px; overflow-y: auto; border: 1px solid var(--vscode-panel-border); background: var(--vscode-editorWidget-background); }
       .message { width: fit-content; max-width: min(78%, 620px); padding: 10px 13px; border-radius: 5px; border-left: 2px solid var(--vscode-testing-iconPassed); background: var(--vscode-textBlockQuote-background); white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.55; }
       .message.user { align-self: flex-end; border-left: 0; border-right: 2px solid var(--vscode-focusBorder); background: var(--vscode-input-background); }
       .message.assistant { align-self: flex-start; }
@@ -101,8 +103,9 @@ function renderWorkbench(webview: vscode.Webview, state: ChatState): string {
       textarea { min-height: 42px; max-height: 322px; resize: none; overflow-y: hidden; padding: 10px; color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border); border-radius: 4px; background: var(--vscode-input-background); font: inherit; line-height: 21px; }
       textarea:focus { outline: 1px solid var(--vscode-focusBorder); outline-offset: -1px; }
       .send { align-self: end; padding: 9px 14px; color: var(--vscode-button-foreground); border: 0; border-radius: 2px; background: var(--vscode-button-background); cursor: pointer; font-weight: 600; }
-      .view#chats { max-width: none; }
-      .chat-layout { width: min(100%, 1280px); max-width: none; }
+      .view#chats { max-width: none; min-height: calc(100vh - 108px); }
+      .chat-layout { width: min(100%, 1280px); max-width: none; min-height: calc(100vh - 240px); }
+      .composer { position: sticky; bottom: 0; padding-top: 10px; background: var(--vscode-editor-background); }
       @media (max-width: 700px) { .workbench { grid-template-columns: 58px minmax(0, 1fr); } .brand span, .nav-label, .rail-footer { display: none; } .brand { justify-content: center; margin-inline: 0; } .nav-button { justify-content: center; padding-inline: 4px; } .board { grid-template-columns: 1fr; } .card--wide { grid-column: auto; } .content { padding: 24px 18px; } }
     </style>
   </head>
