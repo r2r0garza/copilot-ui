@@ -65,6 +65,26 @@ test("keeps lifecycle, forks, trash, summaries, ledger, and audits append-only",
   store.restoreChat(chat.chatId); assert.equal(store.listChats().length, 2); store.close();
 });
 
+test("binds MCP Server Trust to the exact durable configuration fingerprint", () => {
+  const directory = mkdtempSync(join(tmpdir(), "bridgit-mcp-trust-"));
+  const firstFingerprint = "a".repeat(64);
+  const changedFingerprint = "b".repeat(64);
+  const writer = new WorkspaceStore(directory);
+  const trusted = writer.resolveMcpTrust("server", firstFingerprint, "trusted", "2026-07-26T00:00:00.000Z");
+  assert.equal(trusted.version, 1);
+  assert.equal(writer.getMcpTrust("server", changedFingerprint), undefined);
+  writer.resolveMcpTrust("server", changedFingerprint, "denied", "2026-07-26T00:01:00.000Z");
+  assert.equal(writer.getMcpTrust("server", firstFingerprint), undefined);
+  writer.close();
+
+  const reader = new WorkspaceStore(directory);
+  assert.equal(reader.getMcpTrust("server", changedFingerprint)?.decision, "denied");
+  const revised = reader.resolveMcpTrust("server", changedFingerprint, "trusted", "2026-07-26T00:02:00.000Z");
+  assert.equal(revised.version, 2);
+  assert.equal(reader.listEvents().filter((event) => event.name === "mcp.server-trust-resolved").length, 3);
+  reader.close();
+});
+
 test("permanent deletion preserves surviving forks without their deleted-origin pointer", () => {
   const store = new WorkspaceStore(mkdtempSync(join(tmpdir(), "bridgit-fork-delete-")));
   const source = store.createChat("bundled:orchestrator", null); const fork = store.forkChat(source.chatId, "bundled:orchestrator"); store.trashChat(source.chatId); store.deleteChatPermanently(source.chatId, true);

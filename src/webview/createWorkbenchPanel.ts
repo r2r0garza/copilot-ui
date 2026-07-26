@@ -1,9 +1,19 @@
 import * as vscode from "vscode";
 
 import { WorkspaceStore } from "../adapters/sqlite/workspaceStore";
+import type { AgentResource, ResourceCatalogState } from "../features/resources";
 import type { Runtime } from "../runtime/createRuntime";
+import { renderResourceCatalog } from "./resourceView";
 
 const VIEW_TYPE = "bridgit.workbench";
+const bundledOrchestrator: AgentResource = {
+  identity: "bundled:orchestrator",
+  description: "Bridgit’s bundled repository orchestrator.",
+  instructions: "Help the user work safely in the active repository.",
+  model: null,
+  tools: null,
+  status: "available",
+};
 
 export function createWorkbenchPanel(
   context: vscode.ExtensionContext,
@@ -24,8 +34,18 @@ export function createWorkbenchPanel(
   const sendState = (): Thenable<boolean> => { const state = currentState(); selectedChatId = state.selectedChatId; return panel.webview.postMessage({ type: "chat-state", state }); };
   let initialState: ChatState = { chats: [], selectedChatId: undefined, showingTrash: false, messages: [] };
   try { initialState = currentState(); selectedChatId = initialState.selectedChatId; } catch { /* The panel remains usable and surfaces storage errors on Send. */ }
-  panel.webview.html = renderWorkbench(panel.webview, initialState);
+  const initialResourceState = _runtime.resources.getState();
+  panel.webview.html = renderWorkbench(panel.webview, initialState, initialResourceState);
+  const resourceSubscription = _runtime.resources.onDidChange((state) => {
+    void panel.webview.postMessage({ type: "resource-state", html: renderResourceCatalog(state) });
+  });
+  panel.onDidDispose(() => resourceSubscription.dispose());
   panel.webview.onDidReceiveMessage(async (message: unknown) => {
+    if (isResourceRefresh(message)) {
+      const state = _runtime.resources.refresh();
+      await panel.webview.postMessage({ type: "resource-state", html: renderResourceCatalog(state) });
+      return;
+    }
     if (isChatAction(message)) {
       try {
         const authority = getStore(); const selected = selectedChatId;
@@ -57,6 +77,8 @@ export function createWorkbenchPanel(
       if (targetChat.title === "New chat") authority.setChatTitle(targetChat.chatId, await generateChatTitle(model, content));
       const attempt = authority.createResponseAttempt(turn.turnId, model.id, undefined, model.id);
       activeAttemptId = attempt.attemptId;
+      const resourceSnapshot = _runtime.resources.createSnapshot(bundledOrchestrator, model.id, []);
+      authority.pinResourceSnapshot(attempt.attemptId, JSON.stringify(resourceSnapshot), resourceSnapshot.createdAt);
       authority.transitionAttempt(attempt.attemptId, "running");
       const cancellation = new vscode.CancellationTokenSource();
       const response = await model.sendRequest([vscode.LanguageModelChatMessage.User(content)], {}, cancellation.token);
@@ -75,7 +97,7 @@ export function createWorkbenchPanel(
   return panel;
 }
 
-function renderWorkbench(webview: vscode.Webview, state: ChatState): string {
+function renderWorkbench(webview: vscode.Webview, state: ChatState, resources: ResourceCatalogState): string {
   const nonce = createNonce();
 
   return `<!doctype html>
@@ -144,7 +166,51 @@ function renderWorkbench(webview: vscode.Webview, state: ChatState): string {
       .view#chats { max-width: none; height: calc(100vh - 108px); min-height: 0; }
       .chat-layout { width: min(100%, 1280px); max-width: none; min-height: 0; }
       .composer { position: sticky; bottom: 0; padding-top: 10px; background: var(--vscode-editor-background); }
-      @media (max-width: 700px) { .workbench { grid-template-columns: 58px minmax(0, 1fr); } .brand span, .nav-label, .rail-footer { display: none; } .brand { justify-content: center; margin-inline: 0; } .nav-button { justify-content: center; padding-inline: 4px; } .board, .chat-shell { grid-template-columns: 1fr; } .session-list { max-height: 110px; } .card--wide { grid-column: auto; } .content { padding: 24px 18px; } .chat-heading { display: block; } }
+      .resource-view { height: calc(100vh - 44px); max-width: 1280px; overflow-y: auto; padding: 0 2px 48px; scrollbar-gutter: stable; }
+      .resource-masthead { display: flex; align-items: flex-start; justify-content: space-between; gap: 24px; }
+      .resource-masthead .lede { margin-bottom: 22px; }
+      .refresh-action { display: flex; gap: 7px; align-items: center; margin-top: 19px; white-space: nowrap; }
+      .catalog-strip { display: grid; grid-template-columns: repeat(3, minmax(120px, 1fr)) minmax(180px, 1.5fr); margin-bottom: 18px; border: 1px solid var(--vscode-panel-border); background: var(--vscode-sideBar-background); }
+      .catalog-count, .catalog-revision { min-height: 68px; display: flex; align-items: center; gap: 9px; padding: 13px 16px; border-right: 1px solid var(--vscode-panel-border); }
+      .catalog-count strong { font-size: 21px; font-variant-numeric: tabular-nums; }
+      .catalog-count > span:last-child, .catalog-revision span { color: var(--vscode-descriptionForeground); font-size: 11px; text-transform: uppercase; letter-spacing: .07em; }
+      .catalog-revision { border-right: 0; flex-direction: column; align-items: flex-start; justify-content: center; gap: 4px; }
+      .catalog-revision code { color: var(--vscode-textLink-foreground); font-size: 12px; letter-spacing: .06em; }
+      .state-dot { width: 8px; height: 8px; flex: 0 0 auto; border-radius: 50%; background: var(--vscode-descriptionForeground); box-shadow: 0 0 0 3px color-mix(in srgb, var(--vscode-descriptionForeground) 16%, transparent); }
+      .state-dot--available { background: var(--vscode-testing-iconPassed); box-shadow: 0 0 0 3px color-mix(in srgb, var(--vscode-testing-iconPassed) 16%, transparent); }
+      .state-dot--unavailable { background: var(--vscode-editorWarning-foreground); box-shadow: 0 0 0 3px color-mix(in srgb, var(--vscode-editorWarning-foreground) 16%, transparent); }
+      .state-dot--invalid { background: var(--vscode-errorForeground); box-shadow: 0 0 0 3px color-mix(in srgb, var(--vscode-errorForeground) 16%, transparent); }
+      .resource-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; }
+      .resource-group, .diagnostic-ledger { border: 1px solid var(--vscode-panel-border); background: var(--vscode-editorWidget-background); }
+      .resource-group > header, .diagnostic-ledger > header { display: flex; align-items: center; justify-content: space-between; gap: 12px; min-height: 69px; padding: 13px 16px; border-bottom: 1px solid var(--vscode-panel-border); background: linear-gradient(135deg, color-mix(in srgb, var(--vscode-sideBar-background) 88%, transparent), transparent); }
+      .resource-group h2, .diagnostic-ledger h2 { margin: 0; font-size: 14px; font-weight: 650; letter-spacing: .01em; }
+      .resource-group header p { margin: 4px 0 0; color: var(--vscode-descriptionForeground); font-size: 11px; }
+      .resource-total { min-width: 25px; padding: 3px 7px; border: 1px solid var(--vscode-panel-border); color: var(--vscode-descriptionForeground); font: 11px var(--vscode-editor-font-family); text-align: center; }
+      .resource-list { min-height: 176px; }
+      .resource-row { display: grid; grid-template-columns: 8px minmax(0, 1fr) auto; gap: 11px; align-items: start; padding: 13px 15px; border-bottom: 1px solid var(--vscode-panel-border); }
+      .resource-row:last-child { border-bottom: 0; }
+      .resource-row .state-dot { margin-top: 5px; }
+      .resource-copy { min-width: 0; }
+      .resource-name { display: flex; gap: 8px; align-items: baseline; justify-content: space-between; }
+      .resource-name strong { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .resource-name code { color: var(--vscode-descriptionForeground); font-size: 10px; white-space: nowrap; }
+      .resource-copy p { margin: 4px 0 0; color: var(--vscode-descriptionForeground); font-size: 11px; line-height: 1.45; overflow-wrap: anywhere; }
+      .resource-status { display: none; font-size: 9px; text-transform: uppercase; letter-spacing: .06em; }
+      .resource-empty { margin: 0; padding: 22px 16px; color: var(--vscode-descriptionForeground); font-size: 12px; line-height: 1.5; }
+      .diagnostic-ledger { margin-top: 14px; }
+      .diagnostic-ledger .eyebrow { margin-bottom: 3px; }
+      .diagnostic-list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .diagnostic { display: grid; grid-template-columns: auto auto minmax(0, 1fr); gap: 7px 10px; align-items: center; padding: 13px 15px; border-right: 1px solid var(--vscode-panel-border); border-bottom: 1px solid var(--vscode-panel-border); }
+      .diagnostic:nth-child(2n) { border-right: 0; }
+      .diagnostic-severity { padding: 2px 5px; border: 1px solid currentColor; font-size: 9px; text-transform: uppercase; letter-spacing: .07em; }
+      .diagnostic--error .diagnostic-severity { color: var(--vscode-errorForeground); }
+      .diagnostic--warning .diagnostic-severity { color: var(--vscode-editorWarning-foreground); }
+      .diagnostic--info .diagnostic-severity { color: var(--vscode-textLink-foreground); }
+      .diagnostic code { color: var(--vscode-descriptionForeground); font-size: 10px; }
+      .diagnostic strong { overflow: hidden; text-overflow: ellipsis; text-align: right; white-space: nowrap; }
+      .diagnostic p { grid-column: 1 / -1; margin: 1px 0 0; color: var(--vscode-descriptionForeground); font-size: 11px; line-height: 1.45; }
+      @media (max-width: 980px) { .resource-grid { grid-template-columns: 1fr; } .resource-list { min-height: auto; } }
+      @media (max-width: 700px) { .workbench { grid-template-columns: 58px minmax(0, 1fr); } .brand span, .nav-label, .rail-footer { display: none; } .brand { justify-content: center; margin-inline: 0; } .nav-button { justify-content: center; padding-inline: 4px; } .board, .chat-shell { grid-template-columns: 1fr; } .session-list { max-height: 110px; } .card--wide { grid-column: auto; } .content { padding: 24px 18px; } .chat-heading { display: block; } .resource-masthead { display: block; } .refresh-action { margin: 0 0 16px; } .catalog-strip { grid-template-columns: repeat(3, 1fr); } .catalog-revision { grid-column: 1 / -1; border-top: 1px solid var(--vscode-panel-border); } .diagnostic-list { grid-template-columns: 1fr; } .diagnostic { border-right: 0; } }
     </style>
   </head>
   <body>
@@ -155,7 +221,7 @@ function renderWorkbench(webview: vscode.Webview, state: ChatState): string {
           ${navigationButton("tasks", "◈", "Tasks", true)}
           ${navigationButton("chats", "◌", "Chats")}
           ${navigationButton("activity", "≡", "Activity")}
-          ${navigationButton("agents", "◇", "Agents")}
+          ${navigationButton("agents", "◇", "Resources")}
           ${navigationButton("memory", "◫", "Memory")}
           ${navigationButton("settings", "⚙", "Settings")}
         </nav>
@@ -165,18 +231,17 @@ function renderWorkbench(webview: vscode.Webview, state: ChatState): string {
         ${tasksView()}
         ${chatsView(state)}
         ${emptyView("activity", "Activity", "Meaningful outcomes", "Recovery notices, approvals, and execution outcomes will form a concise chronological record here.")}
-        ${emptyView("agents", "Agents", "Repository and bundled agents", "Discovered agents, eligibility, model preferences, and their available resources will appear here.")}
+        ${renderResourceCatalog(resources)}
         ${emptyView("memory", "Memory", "Explicit, inspectable memory", "Project and Personal Memory stay separate from session-local ledgers and require explicit confirmation.")}
         ${emptyView("settings", "Settings", "Repository-scoped Workbench settings", "Model selection, tools, authority, storage, and native resource locations will be configured here.")}
       </section>
     </main>
     <script nonce="${nonce}">
       const buttons = [...document.querySelectorAll('.nav-button')];
-      const views = [...document.querySelectorAll('.view')];
       for (const button of buttons) button.addEventListener('click', () => {
         const target = button.dataset.target;
         for (const candidate of buttons) candidate.setAttribute('aria-selected', String(candidate === button));
-        for (const view of views) view.dataset.active = String(view.id === target);
+        for (const view of document.querySelectorAll('.view')) view.dataset.active = String(view.id === target);
         if (target === 'chats') requestAnimationFrame(scrollToLatest);
       });
       const vscode = acquireVsCodeApi(); const form = document.querySelector('#chat-form'); const input = document.querySelector('#chat-input'); const error = document.querySelector('#chat-error'); const transcript = () => document.querySelector('#transcript'); const scrollToLatest = () => { const element = transcript(); if (element) element.scrollTop = element.scrollHeight; }; const escapeHtml = (value) => value.replace(/[&<>]/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
@@ -185,10 +250,11 @@ function renderWorkbench(webview: vscode.Webview, state: ChatState): string {
       input?.addEventListener('keydown', (event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); form?.requestSubmit(); } });
       form?.addEventListener('submit', (event) => { event.preventDefault(); const content = input.value; const element = transcript(); if (content.trim() && element) { element.innerHTML += '<div class="message user"><strong>you</strong><br>' + escapeHtml(content) + '</div><div id="streaming-response" class="message assistant"><strong>Bridgit</strong><br><span></span></div>'; scrollToLatest(); error.textContent = 'Sending…'; vscode.postMessage({ type: 'chat-send', content }); input.value = ''; resizeComposer(); } });
       const saveRename = () => { const title = document.querySelector('#rename-input')?.value || ''; vscode.postMessage({ type: 'chat-action', action: 'rename', title }); };
+      document.addEventListener('click', (event) => { if (event.target instanceof Element && event.target.closest('#resource-refresh')) vscode.postMessage({ type: 'resource-refresh' }); });
       document.addEventListener('click', (event) => { if (!(event.target instanceof Element)) return; const control = event.target.closest('[data-chat-action]'); if (!control) return; const action = control.dataset.chatAction; const toolbar = document.querySelector('#chat-toolbar'); const selectedTitle = document.querySelector('.session-item[aria-current="true"] span')?.textContent || ''; if (action === 'rename') { if (toolbar) { toolbar.innerHTML = '<input id="rename-input" class="toolbar-input" aria-label="Chat title" value="' + escapeHtml(selectedTitle) + '"><button data-chat-action="rename-save" class="send" type="button">Save</button><button data-chat-action="rename-cancel" class="quiet-action" type="button">Cancel</button>'; const input = document.querySelector('#rename-input'); input?.focus(); input?.select(); } return; } if (action === 'rename-cancel') { vscode.postMessage({ type: 'chat-action', action: 'select' }); return; } if (action === 'rename-save') { saveRename(); return; } if (action === 'delete') { if (toolbar) toolbar.innerHTML = '<span class="muted">Delete this Chat permanently?</span><button data-chat-action="delete-confirm" class="danger-action" type="button">Confirm delete</button><button data-chat-action="delete-cancel" class="quiet-action" type="button">Cancel</button>'; return; } if (action === 'delete-cancel') { vscode.postMessage({ type: 'chat-action', action: 'select' }); return; } if (action === 'delete-confirm') { vscode.postMessage({ type: 'chat-action', action: 'delete' }); return; } vscode.postMessage({ type: 'chat-action', action, chatId: control.dataset.chatId }); });
       document.addEventListener('keydown', (event) => { if (event.key === 'Enter' && event.target instanceof HTMLInputElement && event.target.id === 'rename-input') { event.preventDefault(); saveRename(); } });
       const renderState = (state) => { const sessions = document.querySelector('#session-list'); const toolbar = document.querySelector('#chat-toolbar'); const trashToggle = document.querySelector('#trash-toggle'); const element = transcript(); if (trashToggle) trashToggle.textContent = state.showingTrash ? 'Back' : 'Trash'; if (sessions) sessions.innerHTML = state.chats.map((chat) => '<button class="session-item" data-chat-action="select" data-chat-id="' + chat.chatId + '" aria-current="' + String(chat.chatId === state.selectedChatId) + '"><span>' + chat.label + '</span>' + (chat.forked ? '<small>Fork</small>' : '') + '</button>').join('') || '<p class="muted">' + (state.showingTrash ? 'Trash is empty.' : 'No chats yet.') + '</p>'; if (toolbar) toolbar.innerHTML = !state.selectedChatId ? '<span class="muted">Create a Chat to begin.</span>' : state.showingTrash ? '<button data-chat-action="restore" class="quiet-action" type="button">Restore</button><button data-chat-action="delete" class="danger-action" type="button">Delete permanently</button>' : '<button data-chat-action="rename" class="quiet-action" type="button">Rename</button><button data-chat-action="fork" class="quiet-action" type="button">Fork</button><button data-chat-action="trash" class="quiet-action" type="button">Move to Trash</button>'; if (element) element.innerHTML = state.messages.map((item) => '<div class="message ' + item.role + '"><strong>' + (item.role === 'user' ? 'you' : 'Bridgit') + '</strong><br>' + escapeHtml(item.content) + '</div>').join('') || '<p class="muted">Start a durable Chat session below.</p>'; scrollToLatest(); error.textContent = ''; };
-      window.addEventListener('message', (event) => { const message = event.data; if (message.type === 'chat-state') renderState(message.state); if (message.type === 'chat-stream') { const stream = document.querySelector('#streaming-response span'); if (stream) { stream.textContent = message.content; scrollToLatest(); } } if (message.type === 'chat-error') error.textContent = message.message; });
+      window.addEventListener('message', (event) => { const message = event.data; if (message.type === 'chat-state') renderState(message.state); if (message.type === 'chat-stream') { const stream = document.querySelector('#streaming-response span'); if (stream) { stream.textContent = message.content; scrollToLatest(); } } if (message.type === 'chat-error') error.textContent = message.message; if (message.type === 'resource-state') { const current = document.querySelector('#agents'); if (current) { const active = current.dataset.active; const template = document.createElement('template'); template.innerHTML = message.html; const next = template.content.firstElementChild; if (next) { next.dataset.active = active; current.replaceWith(next); } } } });
     </script>
   </body>
 </html>`;
@@ -204,6 +270,7 @@ async function generateChatTitle(model: vscode.LanguageModelChat, firstMessage: 
 function fallbackChatTitle(firstMessage: string): string { const words = firstMessage.replace(/[^\p{L}\p{N}\s-]/gu, " ").split(/\s+/).filter(Boolean).slice(0, 7); return words.length ? words.join(" ") : "New chat"; }
 function escapeHtml(value: string): string { return value.replace(/[&<>\"]/g, (character) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[character] ?? character); }
 function isSendMessage(value: unknown): value is { type: "chat-send"; content: string } { return typeof value === "object" && value !== null && (value as { type?: unknown }).type === "chat-send" && typeof (value as { content?: unknown }).content === "string"; }
+function isResourceRefresh(value: unknown): value is { type: "resource-refresh" } { return typeof value === "object" && value !== null && (value as { type?: unknown }).type === "resource-refresh"; }
 function isChatAction(value: unknown): value is { type: "chat-action"; action: "new" | "toggle-trash" | "select" | "rename" | "fork" | "trash" | "restore" | "delete"; chatId?: string; title?: string } { return typeof value === "object" && value !== null && (value as { type?: unknown }).type === "chat-action" && ["new", "toggle-trash", "select", "rename", "fork", "trash", "restore", "delete"].includes(String((value as { action?: unknown }).action)); }
 
 function navigationButton(id: string, icon: string, label: string, active = false): string {

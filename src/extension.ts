@@ -1,5 +1,6 @@
 import * as vscode from "vscode";
 
+import { VsCodeWorkspaceResourceService } from "./adapters/vscode/workspaceResourceService";
 import { createRuntime } from "./runtime/createRuntime";
 import { createWorkbenchPanel } from "./webview/createWorkbenchPanel";
 import { LauncherViewProvider } from "./webview/launcherView";
@@ -7,6 +8,7 @@ import { LauncherViewProvider } from "./webview/launcherView";
 export function activate(context: vscode.ExtensionContext): void {
   const runtime = createRuntime({
     workspaceStorageUri: context.storageUri,
+    resources: new VsCodeWorkspaceResourceService(),
   });
 
   context.subscriptions.push(
