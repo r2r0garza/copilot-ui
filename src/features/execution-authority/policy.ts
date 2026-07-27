@@ -1,9 +1,18 @@
 import { createHash, randomUUID } from "node:crypto";
 import { relative, resolve, sep } from "node:path";
 
+import { grantIsActive, type AuthorityContext, type AuthorityGrant } from "./grants";
+
 export type EffectClass = "read" | "repository-write" | "ambient";
-export interface AuthorityGrant { readonly scope: "chat-once" | "chat-session" | "task"; readonly capabilities: readonly string[]; readonly fingerprint: string; }
-export interface ToolRequest { readonly tool: string; readonly effect: EffectClass; readonly input: Record<string, unknown>; readonly paths?: readonly string[]; readonly operationKey: string; }
+export interface ToolRequest {
+  readonly tool: string;
+  readonly effect: EffectClass;
+  readonly input: Record<string, unknown>;
+  readonly paths?: readonly string[];
+  /** Runtime-derived exact authority categories; model-provided arguments never populate this field. */
+  readonly authorityCapabilities?: readonly string[];
+  readonly operationKey: string;
+}
 export interface PolicyDecision { readonly allowed: boolean; readonly reason: string; readonly sanitizedInput: Record<string, unknown>; }
 export interface ToolAudit { readonly auditId: string; readonly operationKey: string; readonly tool: string; readonly decision: PolicyDecision; readonly snapshotId: string; readonly createdAt: string; }
 
@@ -15,13 +24,21 @@ export function validateRepositoryPath(repositoryRoot: string, candidate: string
   return relative(root, target).split(sep).join("/");
 }
 
-export function authorize(request: ToolRequest, grant: AuthorityGrant | undefined, repositoryRoot: string, writeLocked: boolean): PolicyDecision {
+export function authorize(request: ToolRequest, grant: AuthorityGrant | undefined, repositoryRoot: string, writeLocked: boolean, context?: AuthorityContext): PolicyDecision {
   const sanitizedInput = sanitize(request.input);
   try { for (const path of request.paths ?? []) validateRepositoryPath(repositoryRoot, path); } catch (error) { return { allowed: false, reason: error instanceof Error ? error.message : "invalid-path", sanitizedInput }; }
   if (writeLocked && request.effect !== "read") return { allowed: false, reason: "repository-write-lock-held", sanitizedInput };
   if (request.effect === "read") return { allowed: true, reason: "read-only", sanitizedInput };
-  if (!grant || !grant.capabilities.includes(request.tool)) return { allowed: false, reason: "missing-explicit-authority", sanitizedInput };
-  if (request.effect === "ambient" && !grant.capabilities.includes("ambient")) return { allowed: false, reason: "ambient-authority-required", sanitizedInput };
+  if (!grant || !context || !grantIsActive(grant, context)) return { allowed: false, reason: "missing-explicit-authority", sanitizedInput };
+  if (grant.effectClass !== request.effect) return { allowed: false, reason: "effect-class-authority-required", sanitizedInput };
+  if (!grant.capabilities.includes(`tool:${request.tool}`)) return { allowed: false, reason: "tool-authority-required", sanitizedInput };
+  if ((request.tool === "git/stage" || request.tool === "git/commit") && !grant.capabilities.includes("local-commit")) {
+    return { allowed: false, reason: "local-commit-authority-required", sanitizedInput };
+  }
+  if (request.effect === "ambient" && !grant.capabilities.includes(`ambient:${request.tool}`)) return { allowed: false, reason: "ambient-authority-required", sanitizedInput };
+  if ((request.authorityCapabilities ?? []).some((capability) => !grant.capabilities.includes(capability))) {
+    return { allowed: false, reason: "separate-authority-required", sanitizedInput };
+  }
   return { allowed: true, reason: "explicit-grant", sanitizedInput };
 }
 

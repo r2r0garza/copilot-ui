@@ -7,6 +7,7 @@ import test from "node:test";
 import Database from "better-sqlite3";
 
 import { WorkspaceStore } from "../../../src/adapters/sqlite/workspaceStore";
+import { authorityReviewConfirmationHash, grantIsActive } from "../../../src/features/execution-authority";
 
 test("durably pairs a submitted turn with an immutable artifact and event", () => {
   const store = new WorkspaceStore(mkdtempSync(join(tmpdir(), "bridgit-store-")));
@@ -108,6 +109,53 @@ test("binds MCP Server Trust to the exact durable configuration fingerprint", ()
   assert.equal(revised.version, 2);
   assert.equal(reader.listEvents().filter((event) => event.name === "mcp.server-trust-resolved").length, 3);
   reader.close();
+});
+
+test("persists separate fingerprint-bound Chat and Task authority grants", () => {
+  const directory = mkdtempSync(join(tmpdir(), "bridgit-authority-"));
+  const store = new WorkspaceStore(directory);
+  const chat = store.createChat("reviewer", null);
+  const snapshotId = "a".repeat(64);
+  const chatReview = store.createAuthorityReview({
+    owner: { kind: "chat", id: chat.chatId },
+    grantScope: "chat-once",
+    effectClass: "repository-write",
+    capabilities: ["tool:git/commit", "local-commit", "tool:git/commit"],
+    resourceSnapshotId: snapshotId,
+    riskSummary: "Creates one local commit without hooks or remote effects.",
+  }, "2026-07-27T00:00:00.000Z");
+  assert.deepEqual(chatReview.requestedScope.capabilities, ["local-commit", "tool:git/commit"]);
+  assert.throws(() => store.resolveAuthorityReview(chatReview.reviewId, "approved", "wrong"), /confirmation-mismatch/);
+  const chatGrant = store.resolveAuthorityReview(chatReview.reviewId, "approved", authorityReviewConfirmationHash(chatReview), null, "2026-07-27T00:00:01.000Z");
+  assert.ok(chatGrant);
+  assert.equal(grantIsActive(chatGrant, { owner: chatReview.owner, resourceSnapshotId: snapshotId }), true);
+
+  const taskReview = store.createAuthorityReview({
+    owner: { kind: "task", id: "task-1" },
+    grantScope: "task",
+    effectClass: "ambient",
+    capabilities: ["tool:extension/search", "ambient:extension/search", `extension-tool:extension/search@${"b".repeat(64)}`],
+    resourceSnapshotId: null,
+    riskSummary: "Allows one exact external capability for the admitted Task.",
+    taskPhase: "admission",
+  }, "2026-07-27T00:00:02.000Z");
+  const taskGrant = store.resolveAuthorityReview(taskReview.reviewId, "approved", authorityReviewConfirmationHash(taskReview), null, "2026-07-27T00:00:03.000Z");
+  assert.ok(taskGrant);
+  assert.equal(store.listAuthorityGrants(chatReview.owner).length, 1);
+  assert.equal(store.listAuthorityGrants(taskReview.owner).length, 1);
+  assert.equal(grantIsActive(taskGrant, { owner: chatReview.owner, resourceSnapshotId: null }), false);
+  assert.throws(() => store.createAuthorityReview({ ...taskReview, capabilities: taskReview.requestedScope.capabilities, taskPhase: "execution" }), /fixed-at-admission/);
+
+  store.consumeAuthorityGrant(chatGrant.grantId, "2026-07-27T00:00:04.000Z");
+  assert.equal(store.listAuthorityGrants(chatReview.owner)[0]?.consumedAt, "2026-07-27T00:00:04.000Z");
+  assert.throws(() => store.consumeAuthorityGrant(chatGrant.grantId), /not-consumable/);
+  store.revokeAuthorityGrant(taskGrant.grantId, "2026-07-27T00:00:05.000Z");
+  store.close();
+
+  const reopened = new WorkspaceStore(directory);
+  assert.equal(reopened.listAuthorityGrants(chatReview.owner)[0]?.consumedAt, "2026-07-27T00:00:04.000Z");
+  assert.equal(reopened.listAuthorityGrants(taskReview.owner)[0]?.revokedAt, "2026-07-27T00:00:05.000Z");
+  reopened.close();
 });
 
 test("permanent deletion preserves surviving forks without their deleted-origin pointer", () => {

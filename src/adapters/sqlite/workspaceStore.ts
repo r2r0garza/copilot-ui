@@ -3,6 +3,20 @@ import { createHash, randomUUID } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 
+import {
+  authorityGrantFingerprint,
+  authorityReviewConfirmationHash,
+  normalizeAuthorityScope,
+  validateGrantOwner,
+  type AuthorityEffectClass,
+  type AuthorityGrant,
+  type AuthorityGrantScope,
+  type AuthorityOwner,
+  type AuthorityReview,
+  type AuthorityReviewDecision,
+  type CreateAuthorityReview,
+} from "../../features/execution-authority";
+
 export interface ArtifactRef { readonly artifactId: string; readonly mediaType: string; readonly byteCount: number; readonly checksum: string; readonly displayLabel: string; }
 export interface ChatRecord { readonly chatId: string; readonly title: string; readonly version: number; readonly agentIdentity: string; readonly requestedModelId: string | null; readonly createdAt: string; readonly updatedAt: string; readonly originChatId: string | null; readonly trashedAt: string | null; }
 export interface TurnRecord { readonly turnId: string; readonly chatId: string; readonly ordinal: number; readonly content: string; readonly submittedAt: string; }
@@ -119,6 +133,73 @@ export class WorkspaceStore {
   public getMcpTrust(serverIdentity: string, fingerprint: string): McpTrustRecord | undefined {
     return this.db.prepare("SELECT server_identity AS serverIdentity, fingerprint, version, decision, decided_at AS decidedAt, invalidated_at AS invalidatedAt FROM mcp_trust WHERE server_identity = ? AND fingerprint = ? AND invalidated_at IS NULL").get(serverIdentity, fingerprint) as McpTrustRecord | undefined;
   }
+  public createAuthorityReview(input: CreateAuthorityReview, now = new Date().toISOString()): AuthorityReview {
+    validateGrantOwner(input.owner, input.grantScope, input.taskPhase);
+    if (input.owner.kind === "chat" && !this.getChat(input.owner.id)) throw new Error("authority-chat-owner-not-found");
+    if (input.grantScope === "chat-once" && input.resourceSnapshotId === null) throw new Error("chat-once-authority-requires-snapshot");
+    if (input.resourceSnapshotId !== null && !/^[a-f0-9]{64}$/.test(input.resourceSnapshotId)) throw new Error("authority-snapshot-id-invalid");
+    const requestedScope = normalizeAuthorityScope({ capabilities: input.capabilities });
+    const riskSummary = input.riskSummary.trim();
+    if (!riskSummary) throw new Error("authority-risk-summary-empty");
+    const logicalScope = createHash("sha256").update(JSON.stringify({ grantScope: input.grantScope, effectClass: input.effectClass, requestedScope, resourceSnapshotId: input.resourceSnapshotId })).digest("hex");
+    if (this.db.prepare("SELECT 1 FROM authority_reviews WHERE owner_kind = ? AND owner_id = ? AND logical_scope = ? AND status = 'open'").get(input.owner.kind, input.owner.id, logicalScope)) {
+      throw new Error("authority-review-already-open");
+    }
+    const row = this.db.prepare("SELECT COALESCE(MAX(version), 0) AS version FROM authority_reviews WHERE owner_kind = ? AND owner_id = ?").get(input.owner.kind, input.owner.id) as { version: number };
+    const review: AuthorityReview = {
+      reviewId: randomUUID(), owner: input.owner, version: row.version + 1, grantScope: input.grantScope, effectClass: input.effectClass,
+      requestedScope, resourceSnapshotId: input.resourceSnapshotId, riskSummary, status: "open", decision: null, confirmationHash: null, createdAt: now, resolvedAt: null,
+    };
+    this.transaction(() => {
+      this.db.prepare("INSERT INTO authority_reviews (review_id, owner_kind, owner_id, version, grant_scope, effect_class, requested_scope_json, resource_snapshot_id, logical_scope, risk_summary, status, decision, confirmation_hash, created_at, resolved_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', NULL, NULL, ?, NULL)")
+        .run(review.reviewId, review.owner.kind, review.owner.id, review.version, review.grantScope, review.effectClass, JSON.stringify(review.requestedScope), review.resourceSnapshotId, logicalScope, review.riskSummary, now);
+      this.appendEvent("authority.review-opened", review.owner.id, JSON.stringify({ reviewId: review.reviewId, ownerKind: review.owner.kind, grantScope: review.grantScope }), now);
+    });
+    return review;
+  }
+  public resolveAuthorityReview(reviewId: string, decision: AuthorityReviewDecision, confirmationHash: string, expiresAt: string | null = null, now = new Date().toISOString()): AuthorityGrant | undefined {
+    const review = this.getAuthorityReview(reviewId);
+    if (!review || review.status !== "open") throw new Error("authority-review-not-open");
+    if (confirmationHash !== authorityReviewConfirmationHash(review)) throw new Error("authority-confirmation-mismatch");
+    if (expiresAt !== null && expiresAt <= now) throw new Error("authority-expiry-invalid");
+    let grant: AuthorityGrant | undefined;
+    this.transaction(() => {
+      const resolved = this.db.prepare("UPDATE authority_reviews SET status = ?, decision = ?, confirmation_hash = ?, resolved_at = ? WHERE review_id = ? AND status = 'open'").run(decision, decision, confirmationHash, now, reviewId);
+      if (resolved.changes !== 1) throw new Error("authority-review-not-open");
+      if (decision === "approved") {
+        const draft = {
+          grantId: randomUUID(), reviewId, owner: review.owner, scope: review.grantScope, effectClass: review.effectClass,
+          capabilities: review.requestedScope.capabilities, resourceSnapshotId: review.resourceSnapshotId,
+          issuedAt: now, expiresAt, revokedAt: null, consumedAt: null,
+        };
+        grant = { ...draft, fingerprint: authorityGrantFingerprint(draft) };
+        this.db.prepare("INSERT INTO authority_grants (grant_id, review_id, scope_json, effect_class, owner_kind, owner_id, resource_snapshot_id, fingerprint, issued_at, expires_at, revoked_at, consumed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)")
+          .run(grant.grantId, reviewId, JSON.stringify({ capabilities: grant.capabilities }), grant.effectClass, grant.owner.kind, grant.owner.id, grant.resourceSnapshotId, grant.fingerprint, now, expiresAt);
+      }
+      this.appendEvent("authority.review-resolved", review.owner.id, JSON.stringify({ reviewId, decision, grantId: grant?.grantId ?? null }), now);
+    });
+    return grant;
+  }
+  public getAuthorityReview(reviewId: string): AuthorityReview | undefined {
+    const row = this.db.prepare("SELECT review_id AS reviewId, owner_kind AS ownerKind, owner_id AS ownerId, version, grant_scope AS grantScope, effect_class AS effectClass, requested_scope_json AS requestedScopeJson, resource_snapshot_id AS resourceSnapshotId, risk_summary AS riskSummary, status, decision, confirmation_hash AS confirmationHash, created_at AS createdAt, resolved_at AS resolvedAt FROM authority_reviews WHERE review_id = ?").get(reviewId) as AuthorityReviewRow | undefined;
+    return row ? mapAuthorityReview(row) : undefined;
+  }
+  public listAuthorityGrants(owner: AuthorityOwner): readonly AuthorityGrant[] {
+    const rows = this.db.prepare("SELECT g.grant_id AS grantId, g.review_id AS reviewId, r.grant_scope AS scope, g.scope_json AS scopeJson, g.effect_class AS effectClass, g.owner_kind AS ownerKind, g.owner_id AS ownerId, g.resource_snapshot_id AS resourceSnapshotId, g.fingerprint, g.issued_at AS issuedAt, g.expires_at AS expiresAt, g.revoked_at AS revokedAt, g.consumed_at AS consumedAt FROM authority_grants g JOIN authority_reviews r ON r.review_id = g.review_id WHERE g.owner_kind = ? AND g.owner_id = ? ORDER BY g.issued_at").all(owner.kind, owner.id) as AuthorityGrantRow[];
+    return rows.map(mapAuthorityGrant);
+  }
+  public consumeAuthorityGrant(grantId: string, now = new Date().toISOString()): void {
+    const grant = this.db.prepare("SELECT r.grant_scope AS scope FROM authority_grants g JOIN authority_reviews r ON r.review_id = g.review_id WHERE g.grant_id = ? AND g.revoked_at IS NULL AND g.consumed_at IS NULL").get(grantId) as { scope: AuthorityGrantScope } | undefined;
+    if (grant?.scope !== "chat-once") throw new Error("authority-grant-not-consumable");
+    const result = this.db.prepare("UPDATE authority_grants SET consumed_at = ? WHERE grant_id = ? AND revoked_at IS NULL AND consumed_at IS NULL").run(now, grantId);
+    if (result.changes !== 1) throw new Error("authority-grant-not-consumable");
+    this.appendEvent("authority.grant-consumed", grantId, "{}", now);
+  }
+  public revokeAuthorityGrant(grantId: string, now = new Date().toISOString()): void {
+    const result = this.db.prepare("UPDATE authority_grants SET revoked_at = ? WHERE grant_id = ? AND revoked_at IS NULL").run(now, grantId);
+    if (result.changes !== 1) throw new Error("authority-grant-not-active");
+    this.appendEvent("authority.grant-revoked", grantId, "{}", now);
+  }
   public acquireRepositoryWriteLock(holderId: string, now = new Date().toISOString()): boolean { const result = this.db.prepare("INSERT INTO repository_write_lock (lock_id, holder_id, acquired_at) VALUES (1, ?, ?) ON CONFLICT(lock_id) DO NOTHING").run(holderId, now); if (result.changes) this.appendEvent("repository.write-lock-acquired", holderId, "{}", now); return result.changes === 1; }
   public releaseRepositoryWriteLock(holderId: string, now = new Date().toISOString()): boolean { const result = this.db.prepare("DELETE FROM repository_write_lock WHERE lock_id = 1 AND holder_id = ?").run(holderId); if (result.changes) this.appendEvent("repository.write-lock-released", holderId, "{}", now); return result.changes === 1; }
   public repositoryWriteLocked(): boolean { return Boolean(this.db.prepare("SELECT 1 FROM repository_write_lock WHERE lock_id = 1").get()); }
@@ -136,10 +217,89 @@ export class WorkspaceStore {
   private transaction(work: () => void): void { this.db.transaction(work)(); }
   /** Extension-host restarts cannot resume model work; make any prior in-flight attempt inspectable and retryable. */
   private interruptAbandonedAttempts(): void { const now = new Date().toISOString(); this.transaction(() => { const attempts = this.db.prepare("SELECT attempt_id as attemptId FROM response_attempts WHERE state IN ('preparing','running','waiting-for-approval')").all() as { attemptId: string }[]; for (const attempt of attempts) { this.db.prepare("UPDATE response_attempts SET state = 'interrupted', ended_at = ? WHERE attempt_id = ?").run(now, attempt.attemptId); this.appendEvent("response.interrupted", attempt.attemptId, JSON.stringify({ reason: "extension-host-restart" }), now); } }); }
-  private migrate(): void { this.db.exec("CREATE TABLE IF NOT EXISTS artifacts (artifact_id TEXT PRIMARY KEY, media_type TEXT NOT NULL, byte_count INTEGER NOT NULL, checksum TEXT NOT NULL, display_label TEXT NOT NULL, content TEXT NOT NULL); CREATE TABLE IF NOT EXISTS chat_sessions (chat_id TEXT PRIMARY KEY, title TEXT NOT NULL DEFAULT 'New chat', version INTEGER NOT NULL, agent_identity TEXT NOT NULL, requested_model_id TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, origin_chat_id TEXT REFERENCES chat_sessions(chat_id), trashed_at TEXT); CREATE TABLE IF NOT EXISTS chat_turns (turn_id TEXT PRIMARY KEY, chat_id TEXT NOT NULL REFERENCES chat_sessions(chat_id) ON DELETE CASCADE, ordinal INTEGER NOT NULL, content_artifact_id TEXT NOT NULL REFERENCES artifacts(artifact_id), submitted_at TEXT NOT NULL, UNIQUE(chat_id, ordinal)); CREATE TABLE IF NOT EXISTS response_attempts (attempt_id TEXT PRIMARY KEY, turn_id TEXT NOT NULL REFERENCES chat_turns(turn_id) ON DELETE CASCADE, ordinal INTEGER NOT NULL, state TEXT NOT NULL, requested_model_id TEXT, created_at TEXT NOT NULL, effective_model_id TEXT, snapshot_id TEXT, ended_at TEXT, UNIQUE(turn_id, ordinal)); CREATE TABLE IF NOT EXISTS chat_outputs (output_id TEXT PRIMARY KEY, turn_id TEXT NOT NULL REFERENCES chat_turns(turn_id) ON DELETE CASCADE, artifact_id TEXT NOT NULL REFERENCES artifacts(artifact_id), created_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS chat_stream_outputs (turn_id TEXT PRIMARY KEY REFERENCES chat_turns(turn_id) ON DELETE CASCADE, content TEXT NOT NULL, updated_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS chat_summaries (summary_id TEXT PRIMARY KEY, chat_id TEXT NOT NULL REFERENCES chat_sessions(chat_id) ON DELETE CASCADE, content TEXT NOT NULL, provenance TEXT NOT NULL, active INTEGER NOT NULL, created_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS session_ledger (entry_id TEXT PRIMARY KEY, chat_id TEXT NOT NULL REFERENCES chat_sessions(chat_id) ON DELETE CASCADE, kind TEXT NOT NULL, content TEXT NOT NULL, provenance TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS resource_snapshots (snapshot_id TEXT PRIMARY KEY, attempt_id TEXT NOT NULL REFERENCES response_attempts(attempt_id) ON DELETE CASCADE, content TEXT NOT NULL, created_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS repository_write_lock (lock_id INTEGER PRIMARY KEY CHECK(lock_id = 1), holder_id TEXT NOT NULL, acquired_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS mcp_trust (server_identity TEXT NOT NULL, fingerprint TEXT NOT NULL, version INTEGER NOT NULL, decision TEXT NOT NULL CHECK(decision IN ('trusted','denied')), decided_at TEXT NOT NULL, invalidated_at TEXT, PRIMARY KEY(server_identity, fingerprint)); CREATE TABLE IF NOT EXISTS tool_audits (audit_id TEXT PRIMARY KEY, attempt_id TEXT NOT NULL REFERENCES response_attempts(attempt_id) ON DELETE CASCADE, operation_key TEXT NOT NULL, tool_identity TEXT NOT NULL, snapshot_id TEXT NOT NULL, decision TEXT NOT NULL, input TEXT NOT NULL, outcome TEXT, created_at TEXT NOT NULL, completed_at TEXT); CREATE TABLE IF NOT EXISTS projection_events (sequence INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, aggregate_id TEXT NOT NULL, payload TEXT NOT NULL, emitted_at TEXT NOT NULL);"); this.addColumn("chat_sessions", "title", "TEXT NOT NULL DEFAULT 'New chat'"); this.addColumn("chat_sessions", "origin_chat_id", "TEXT"); this.addColumn("chat_sessions", "trashed_at", "TEXT"); this.addColumn("response_attempts", "effective_model_id", "TEXT"); this.addColumn("response_attempts", "snapshot_id", "TEXT"); this.addColumn("response_attempts", "ended_at", "TEXT"); this.db.exec("CREATE UNIQUE INDEX IF NOT EXISTS resource_snapshots_attempt_unique ON resource_snapshots(attempt_id)"); }
+  private migrate(): void {
+    this.db.exec("CREATE TABLE IF NOT EXISTS artifacts (artifact_id TEXT PRIMARY KEY, media_type TEXT NOT NULL, byte_count INTEGER NOT NULL, checksum TEXT NOT NULL, display_label TEXT NOT NULL, content TEXT NOT NULL); CREATE TABLE IF NOT EXISTS chat_sessions (chat_id TEXT PRIMARY KEY, title TEXT NOT NULL DEFAULT 'New chat', version INTEGER NOT NULL, agent_identity TEXT NOT NULL, requested_model_id TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, origin_chat_id TEXT REFERENCES chat_sessions(chat_id), trashed_at TEXT); CREATE TABLE IF NOT EXISTS chat_turns (turn_id TEXT PRIMARY KEY, chat_id TEXT NOT NULL REFERENCES chat_sessions(chat_id) ON DELETE CASCADE, ordinal INTEGER NOT NULL, content_artifact_id TEXT NOT NULL REFERENCES artifacts(artifact_id), submitted_at TEXT NOT NULL, UNIQUE(chat_id, ordinal)); CREATE TABLE IF NOT EXISTS response_attempts (attempt_id TEXT PRIMARY KEY, turn_id TEXT NOT NULL REFERENCES chat_turns(turn_id) ON DELETE CASCADE, ordinal INTEGER NOT NULL, state TEXT NOT NULL, requested_model_id TEXT, created_at TEXT NOT NULL, effective_model_id TEXT, snapshot_id TEXT, ended_at TEXT, UNIQUE(turn_id, ordinal)); CREATE TABLE IF NOT EXISTS chat_outputs (output_id TEXT PRIMARY KEY, turn_id TEXT NOT NULL REFERENCES chat_turns(turn_id) ON DELETE CASCADE, artifact_id TEXT NOT NULL REFERENCES artifacts(artifact_id), created_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS chat_stream_outputs (turn_id TEXT PRIMARY KEY REFERENCES chat_turns(turn_id) ON DELETE CASCADE, content TEXT NOT NULL, updated_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS chat_summaries (summary_id TEXT PRIMARY KEY, chat_id TEXT NOT NULL REFERENCES chat_sessions(chat_id) ON DELETE CASCADE, content TEXT NOT NULL, provenance TEXT NOT NULL, active INTEGER NOT NULL, created_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS session_ledger (entry_id TEXT PRIMARY KEY, chat_id TEXT NOT NULL REFERENCES chat_sessions(chat_id) ON DELETE CASCADE, kind TEXT NOT NULL, content TEXT NOT NULL, provenance TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS resource_snapshots (snapshot_id TEXT PRIMARY KEY, attempt_id TEXT NOT NULL REFERENCES response_attempts(attempt_id) ON DELETE CASCADE, content TEXT NOT NULL, created_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS repository_write_lock (lock_id INTEGER PRIMARY KEY CHECK(lock_id = 1), holder_id TEXT NOT NULL, acquired_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS mcp_trust (server_identity TEXT NOT NULL, fingerprint TEXT NOT NULL, version INTEGER NOT NULL, decision TEXT NOT NULL CHECK(decision IN ('trusted','denied')), decided_at TEXT NOT NULL, invalidated_at TEXT, PRIMARY KEY(server_identity, fingerprint)); CREATE TABLE IF NOT EXISTS tool_audits (audit_id TEXT PRIMARY KEY, attempt_id TEXT NOT NULL REFERENCES response_attempts(attempt_id) ON DELETE CASCADE, operation_key TEXT NOT NULL, tool_identity TEXT NOT NULL, snapshot_id TEXT NOT NULL, decision TEXT NOT NULL, input TEXT NOT NULL, outcome TEXT, created_at TEXT NOT NULL, completed_at TEXT); CREATE TABLE IF NOT EXISTS projection_events (sequence INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, aggregate_id TEXT NOT NULL, payload TEXT NOT NULL, emitted_at TEXT NOT NULL);");
+    this.db.exec("CREATE TABLE IF NOT EXISTS authority_reviews (review_id TEXT PRIMARY KEY, owner_kind TEXT NOT NULL CHECK(owner_kind IN ('chat','task')), owner_id TEXT NOT NULL, version INTEGER NOT NULL, grant_scope TEXT NOT NULL CHECK(grant_scope IN ('chat-once','chat-session','task')), effect_class TEXT NOT NULL CHECK(effect_class IN ('read','repository-write','ambient')), requested_scope_json TEXT NOT NULL, resource_snapshot_id TEXT, logical_scope TEXT NOT NULL, risk_summary TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('open','approved','denied','stale','cancelled')), decision TEXT CHECK(decision IN ('approved','denied')), confirmation_hash TEXT, created_at TEXT NOT NULL, resolved_at TEXT); CREATE TABLE IF NOT EXISTS authority_grants (grant_id TEXT PRIMARY KEY, review_id TEXT NOT NULL REFERENCES authority_reviews(review_id) ON DELETE RESTRICT, scope_json TEXT NOT NULL, effect_class TEXT NOT NULL CHECK(effect_class IN ('read','repository-write','ambient')), owner_kind TEXT NOT NULL CHECK(owner_kind IN ('chat','task')), owner_id TEXT NOT NULL, resource_snapshot_id TEXT, fingerprint TEXT NOT NULL, issued_at TEXT NOT NULL, expires_at TEXT, revoked_at TEXT, consumed_at TEXT);");
+    this.addColumn("chat_sessions", "title", "TEXT NOT NULL DEFAULT 'New chat'");
+    this.addColumn("chat_sessions", "origin_chat_id", "TEXT");
+    this.addColumn("chat_sessions", "trashed_at", "TEXT");
+    this.addColumn("response_attempts", "effective_model_id", "TEXT");
+    this.addColumn("response_attempts", "snapshot_id", "TEXT");
+    this.addColumn("response_attempts", "ended_at", "TEXT");
+    this.db.exec("CREATE UNIQUE INDEX IF NOT EXISTS resource_snapshots_attempt_unique ON resource_snapshots(attempt_id); CREATE UNIQUE INDEX IF NOT EXISTS authority_reviews_open_scope_unique ON authority_reviews(owner_kind, owner_id, logical_scope) WHERE status = 'open'");
+  }
   private addColumn(table: string, column: string, type: string): void { try { this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`); } catch { /* Existing databases already have the column. */ } }
 }
 
 function isRecord(value: unknown): value is Readonly<Record<string, unknown>> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+interface AuthorityReviewRow {
+  readonly reviewId: string;
+  readonly ownerKind: AuthorityOwner["kind"];
+  readonly ownerId: string;
+  readonly version: number;
+  readonly grantScope: AuthorityGrantScope;
+  readonly effectClass: AuthorityEffectClass;
+  readonly requestedScopeJson: string;
+  readonly resourceSnapshotId: string | null;
+  readonly riskSummary: string;
+  readonly status: AuthorityReview["status"];
+  readonly decision: AuthorityReviewDecision | null;
+  readonly confirmationHash: string | null;
+  readonly createdAt: string;
+  readonly resolvedAt: string | null;
+}
+
+interface AuthorityGrantRow {
+  readonly grantId: string;
+  readonly reviewId: string;
+  readonly scope: AuthorityGrantScope;
+  readonly scopeJson: string;
+  readonly effectClass: AuthorityEffectClass;
+  readonly ownerKind: AuthorityOwner["kind"];
+  readonly ownerId: string;
+  readonly resourceSnapshotId: string | null;
+  readonly fingerprint: string;
+  readonly issuedAt: string;
+  readonly expiresAt: string | null;
+  readonly revokedAt: string | null;
+  readonly consumedAt: string | null;
+}
+
+function mapAuthorityReview(row: AuthorityReviewRow): AuthorityReview {
+  return {
+    reviewId: row.reviewId,
+    owner: { kind: row.ownerKind, id: row.ownerId },
+    version: row.version,
+    grantScope: row.grantScope,
+    effectClass: row.effectClass,
+    requestedScope: JSON.parse(row.requestedScopeJson) as AuthorityReview["requestedScope"],
+    resourceSnapshotId: row.resourceSnapshotId,
+    riskSummary: row.riskSummary,
+    status: row.status,
+    decision: row.decision,
+    confirmationHash: row.confirmationHash,
+    createdAt: row.createdAt,
+    resolvedAt: row.resolvedAt,
+  };
+}
+
+function mapAuthorityGrant(row: AuthorityGrantRow): AuthorityGrant {
+  const scope = JSON.parse(row.scopeJson) as { readonly capabilities: readonly string[] };
+  return {
+    grantId: row.grantId,
+    reviewId: row.reviewId,
+    owner: { kind: row.ownerKind, id: row.ownerId },
+    scope: row.scope,
+    effectClass: row.effectClass,
+    capabilities: scope.capabilities,
+    resourceSnapshotId: row.resourceSnapshotId,
+    fingerprint: row.fingerprint,
+    issuedAt: row.issuedAt,
+    expiresAt: row.expiresAt,
+    revokedAt: row.revokedAt,
+    consumedAt: row.consumedAt,
+  };
 }
