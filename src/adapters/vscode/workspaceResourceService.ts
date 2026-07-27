@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import * as vscode from "vscode";
 
 import {
@@ -24,7 +25,12 @@ export class VsCodeWorkspaceResourceService implements ResourceService {
 
   public constructor() {
     const workspace = activeWorkspace();
-    this.controller = new ResourceCatalogController(workspace?.uri.fsPath ?? null, workspace?.name);
+    this.controller = new ResourceCatalogController(
+      workspace?.uri.fsPath ?? null,
+      workspace?.name,
+      undefined,
+      registeredExtensionTools,
+    );
     this.rebuildWatchers(workspace);
     this.disposables.push(vscode.workspace.onDidChangeWorkspaceFolders(() => {
       const next = activeWorkspace();
@@ -79,4 +85,24 @@ export class VsCodeWorkspaceResourceService implements ResourceService {
 
 function activeWorkspace(): vscode.WorkspaceFolder | undefined {
   return vscode.workspace.workspaceFolders?.[0];
+}
+
+function registeredExtensionTools(): readonly ToolResource[] {
+  return vscode.lm.tools.map((tool) => {
+    const inputSchema = isRecord(tool.inputSchema) ? tool.inputSchema : {};
+    return {
+      identity: tool.name,
+      description: tool.description,
+      origin: "extension",
+      effectClass: "ambient",
+      status: "available",
+      inputSchema,
+      inputSchemaFingerprint: createHash("sha256").update(JSON.stringify(inputSchema)).digest("hex"),
+      resultSchema: {},
+    };
+  });
+}
+
+function isRecord(value: unknown): value is Readonly<Record<string, unknown>> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }

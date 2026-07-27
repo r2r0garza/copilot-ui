@@ -5,6 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 
 import { ResourceCatalogController } from "../../../src/features/resources/service";
+import type { ToolResource } from "../../../src/features/resources/catalog";
 
 test("refreshes changed canonical resources into monotonic catalog revisions", () => {
   const root = workspace();
@@ -65,6 +66,29 @@ test("switches the active workspace atomically and exposes a no-workspace state"
   assert.equal(empty.revision, 3);
   assert.equal(empty.workspaceRoot, null);
   assert.equal(empty.catalog.agents.length, 0);
+  controller.dispose();
+});
+
+test("refreshes host-registered Tools without changing their extension origin", () => {
+  const root = workspace();
+  let tools: readonly ToolResource[] = [];
+  const controller = new ResourceCatalogController(root, "fixture", undefined, () => tools);
+
+  assert.deepEqual(controller.getState().catalog.tools.map((tool) => tool.origin), ["workbench", "workbench", "workbench"]);
+  tools = [{
+    identity: "extension/search",
+    description: "Search through an extension.",
+    origin: "extension",
+    effectClass: "ambient",
+    status: "available",
+    inputSchema: { type: "object" },
+    inputSchemaFingerprint: "f".repeat(64),
+    resultSchema: {},
+  }];
+  const refreshed = controller.refresh();
+  assert.equal(refreshed.revision, 2);
+  assert.equal(refreshed.catalog.tools.at(-1)?.identity, "extension/search");
+  assert.equal(refreshed.catalog.tools.at(-1)?.origin, "extension");
   controller.dispose();
 });
 

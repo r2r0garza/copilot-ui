@@ -261,12 +261,20 @@ function renderWorkbench(webview: vscode.Webview, state: ChatViewState, resource
       .state-dot--available { background: var(--vscode-testing-iconPassed); box-shadow: 0 0 0 3px color-mix(in srgb, var(--vscode-testing-iconPassed) 16%, transparent); }
       .state-dot--unavailable { background: var(--vscode-editorWarning-foreground); box-shadow: 0 0 0 3px color-mix(in srgb, var(--vscode-editorWarning-foreground) 16%, transparent); }
       .state-dot--invalid { background: var(--vscode-errorForeground); box-shadow: 0 0 0 3px color-mix(in srgb, var(--vscode-errorForeground) 16%, transparent); }
-      .resource-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px; }
+      .resource-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); align-items: start; gap: 14px; }
       .resource-group, .diagnostic-ledger { border: 1px solid var(--vscode-panel-border); background: var(--vscode-editorWidget-background); }
-      .resource-group > header, .diagnostic-ledger > header { display: flex; align-items: center; justify-content: space-between; gap: 12px; min-height: 69px; padding: 13px 16px; border-bottom: 1px solid var(--vscode-panel-border); background: linear-gradient(135deg, color-mix(in srgb, var(--vscode-sideBar-background) 88%, transparent), transparent); }
+      .resource-group > summary, .diagnostic-ledger > header { display: flex; align-items: center; justify-content: space-between; gap: 12px; min-height: 69px; padding: 13px 16px; background: linear-gradient(135deg, color-mix(in srgb, var(--vscode-sideBar-background) 88%, transparent), transparent); }
+      .resource-group > summary { cursor: pointer; list-style: none; user-select: none; }
+      .resource-group > summary::-webkit-details-marker { display: none; }
+      .resource-group > summary:hover { background-color: var(--vscode-list-hoverBackground); }
+      .resource-group > summary:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: -1px; }
+      .resource-group[open] > summary, .diagnostic-ledger > header { border-bottom: 1px solid var(--vscode-panel-border); }
       .resource-group h2, .diagnostic-ledger h2 { margin: 0; font-size: 14px; font-weight: 650; letter-spacing: .01em; }
-      .resource-group header p { margin: 4px 0 0; color: var(--vscode-descriptionForeground); font-size: 11px; }
+      .resource-group summary p { margin: 4px 0 0; color: var(--vscode-descriptionForeground); font-size: 11px; }
+      .resource-group-meta { display: flex; align-items: center; gap: 9px; }
       .resource-total { min-width: 25px; padding: 3px 7px; border: 1px solid var(--vscode-panel-border); color: var(--vscode-descriptionForeground); font: 11px var(--vscode-editor-font-family); text-align: center; }
+      .resource-chevron { color: var(--vscode-descriptionForeground); font-size: 16px; line-height: 1; transform: rotate(-90deg); transition: transform 120ms ease; }
+      .resource-group[open] .resource-chevron { transform: rotate(0); }
       .resource-list { min-height: 176px; }
       .resource-row { display: grid; grid-template-columns: 8px minmax(0, 1fr) auto; gap: 11px; align-items: start; padding: 13px 15px; border-bottom: 1px solid var(--vscode-panel-border); }
       .resource-row:last-child { border-bottom: 0; }

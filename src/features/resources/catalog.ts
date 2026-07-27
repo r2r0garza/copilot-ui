@@ -48,6 +48,7 @@ export interface McpServer {
 
 export interface ToolResource {
   readonly identity: string;
+  readonly description: string;
   readonly origin: ToolOrigin;
   readonly effectClass: "read" | "repository-write" | "ambient";
   readonly status: ResourceStatus;
@@ -92,14 +93,15 @@ const SKILL_FIELDS = new Set([
 ]);
 
 /** Fixed, shallow repository discovery. Invalid entries are isolated from valid peers. */
-export function discoverResources(root: string): ResourceCatalog {
+export function discoverResources(root: string, additionalTools: readonly ToolResource[] = []): ResourceCatalog {
   const diagnostics: Diagnostic[] = [];
   const agents = discoverAgents(join(root, ".github", "agents"), diagnostics);
   const skills = discoverSkills(join(root, ".github", "skills"), diagnostics);
   const mcp = readMcpConfiguration(join(root, ".vscode", "mcp.json"));
   diagnostics.push(...mcp.diagnostics);
   const mcpServers = mcp.servers;
-  return { agents, skills, mcpServers, tools: repositoryToolCatalog, diagnostics };
+  const tools = mergeToolCatalog([...repositoryToolCatalog, ...additionalTools], diagnostics);
+  return { agents, skills, mcpServers, tools, diagnostics };
 }
 
 /** Skill instructions are intentionally read only after selection. */
@@ -112,9 +114,38 @@ export function loadSkillInstructions(root: string, skillName: string): string {
   return parsed.body;
 }
 
+export interface ToolSelection {
+  readonly tools: readonly ToolResource[];
+  readonly unresolved: readonly string[];
+}
+
+/**
+ * Resolves the native Agent allowlist exactly. Unknown, unavailable, invalid,
+ * and identity-colliding Tools stay unresolved and are never substituted.
+ */
+export function resolveToolSelection(catalog: readonly ToolResource[], allowlist: readonly string[] | null): ToolSelection {
+  const identityCounts = new Map<string, number>();
+  for (const tool of catalog) identityCounts.set(tool.identity, (identityCounts.get(tool.identity) ?? 0) + 1);
+  const eligible = catalog.filter((tool) => tool.status === "available" && identityCounts.get(tool.identity) === 1);
+  if (allowlist === null) return { tools: eligible, unresolved: [] };
+
+  const selected = new Set<string>();
+  const unresolved: string[] = [];
+  for (const selector of allowlist) {
+    const matches = validToolSelector(selector)
+      ? eligible.filter((tool) => matchesToolSelector(tool.identity, selector))
+      : [];
+    if (matches.length === 0) unresolved.push(selector);
+    for (const tool of matches) selected.add(tool.identity);
+  }
+  return {
+    tools: eligible.filter((tool) => selected.has(tool.identity)),
+    unresolved,
+  };
+}
+
 export function selectTools(available: readonly ToolResource[], allowlist: readonly string[] | null): readonly ToolResource[] {
-  if (allowlist === null) return available.filter((tool) => tool.status === "available");
-  return available.filter((tool) => tool.status === "available" && allowlist.some((item) => item === tool.identity || (item.endsWith("/*") && tool.identity.startsWith(item.slice(0, -1)))));
+  return resolveToolSelection(available, allowlist).tools;
 }
 
 export function pinSnapshot(catalog: ResourceCatalog, agent: AgentResource, effectiveModelId: string, tools: readonly ToolResource[], now = new Date().toISOString(), catalogRevision = 0): ResourceSnapshot {
@@ -159,6 +190,44 @@ function discoverAgents(directory: string, diagnostics: Diagnostic[]): AgentReso
     }
   }
   return agents;
+}
+
+function mergeToolCatalog(tools: readonly ToolResource[], diagnostics: Diagnostic[]): readonly ToolResource[] {
+  const identities = new Map<string, number[]>();
+  for (const [index, tool] of tools.entries()) {
+    identities.set(tool.identity, [...(identities.get(tool.identity) ?? []), index]);
+  }
+
+  const merged = tools.map((tool) => ({ ...tool }));
+  for (const [identity, indexes] of identities) {
+    if (indexes.length < 2) continue;
+    const origins = [...new Set(indexes.map((index) => tools[index].origin))].sort();
+    for (const index of indexes) {
+      merged[index] = {
+        ...merged[index],
+        status: "invalid",
+        reason: `Tool identity conflicts across catalog sources (${origins.join(", ")}).`,
+      };
+    }
+    addDiagnostic(
+      diagnostics,
+      `tool:${identity}`,
+      "tool.identity-collision",
+      "error",
+      `Tool identity is registered ${indexes.length} times across ${origins.join(", ")} origins; every conflicting Tool was disabled.`,
+    );
+  }
+  return merged;
+}
+
+function validToolSelector(selector: string): boolean {
+  if (selector.length === 0 || selector.trim() !== selector) return false;
+  const wildcard = selector.indexOf("*");
+  return wildcard === -1 || (selector.endsWith("/*") && wildcard === selector.length - 1 && selector.length > 2);
+}
+
+function matchesToolSelector(identity: string, selector: string): boolean {
+  return selector === identity || (selector.endsWith("/*") && identity.startsWith(selector.slice(0, -1)));
 }
 
 function parseAgent(file: string, identity: string, diagnostics: Diagnostic[]): AgentResource {

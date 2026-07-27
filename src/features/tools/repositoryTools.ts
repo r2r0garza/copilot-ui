@@ -90,9 +90,9 @@ const writeResultSchema = schema({
 });
 
 export const repositoryToolCatalog: readonly ToolResource[] = [
-  tool("files/list", "read", listInputSchema, listResultSchema),
-  tool("files/read", "read", readInputSchema, readResultSchema),
-  tool("files/write", "repository-write", writeInputSchema, writeResultSchema),
+  tool("files/list", "List direct children of a repository directory.", "read", listInputSchema, listResultSchema),
+  tool("files/read", "Read a bounded UTF-8 repository file.", "read", readInputSchema, readResultSchema),
+  tool("files/write", "Create or atomically replace a repository file.", "repository-write", writeInputSchema, writeResultSchema),
 ];
 
 export interface RepositoryListResult {
@@ -266,9 +266,10 @@ export class RepositoryToolExecutor {
   }
 }
 
-function tool(identity: string, effectClass: ToolResource["effectClass"], inputSchema: JsonObject, resultSchema: JsonObject): ToolResource {
+function tool(identity: string, description: string, effectClass: ToolResource["effectClass"], inputSchema: JsonObject, resultSchema: JsonObject): ToolResource {
   return {
     identity,
+    description,
     origin: "workbench",
     effectClass,
     status: "available",

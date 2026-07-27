@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
-import { discoverResources, loadSkillInstructions, pinSnapshot, selectTools, type ToolResource } from "../../../src/features/resources/catalog";
+import { discoverResources, loadSkillInstructions, pinSnapshot, resolveToolSelection, selectTools, type ToolResource } from "../../../src/features/resources/catalog";
 
 test("discovers valid repository resources while isolating invalid peers", () => {
   const root = mkdtempSync(join(tmpdir(), "bridgit-resources-"));
@@ -26,15 +26,31 @@ test("discovers valid repository resources while isolating invalid peers", () =>
 
 test("keeps explicit tool allowlists narrow and pins immutable snapshots", () => {
   const tools: ToolResource[] = [
-    { identity: "files/read", origin: "workbench", effectClass: "read", status: "available", inputSchema: {}, inputSchemaFingerprint: "a", resultSchema: {} },
-    { identity: "server/query", origin: "mcp", effectClass: "ambient", status: "available", inputSchema: {}, inputSchemaFingerprint: "b", resultSchema: {} },
-    { identity: "server/offline", origin: "mcp", effectClass: "ambient", status: "unavailable", inputSchema: {}, inputSchemaFingerprint: "c", resultSchema: {}, reason: "Offline." },
+    { identity: "files/read", description: "Read.", origin: "workbench", effectClass: "read", status: "available", inputSchema: {}, inputSchemaFingerprint: "a", resultSchema: {} },
+    { identity: "server/query", description: "Query.", origin: "mcp", effectClass: "ambient", status: "available", inputSchema: {}, inputSchemaFingerprint: "b", resultSchema: {} },
+    { identity: "server/offline", description: "Offline.", origin: "mcp", effectClass: "ambient", status: "unavailable", inputSchema: {}, inputSchemaFingerprint: "c", resultSchema: {}, reason: "Offline." },
   ];
   assert.deepEqual(selectTools(tools, ["server/*"]).map((tool) => tool.identity), ["server/query"]);
   assert.deepEqual(selectTools(tools, ["files/read", "unknown/tool"]).map((tool) => tool.identity), ["files/read"]);
+  assert.deepEqual(resolveToolSelection(tools, ["files/read", "unknown/tool", "bad*"]).unresolved, ["unknown/tool", "bad*"]);
   const catalog = { agents: [], skills: [], mcpServers: [], tools: [], diagnostics: [] };
   const snapshot = pinSnapshot(catalog, { identity: "a", description: "d", instructions: "i", model: null, tools: null, status: "available" }, "model-a", tools, "2026-07-25T00:00:00.000Z");
   assert.equal(snapshot.tools.length, 2); assert.equal(snapshot.effectiveModelId, "model-a");
+});
+
+test("preserves Tool origins and disables every cross-source identity collision", () => {
+  const root = workspace();
+  const extensionTools: ToolResource[] = [
+    { identity: "extension/search", description: "Search.", origin: "extension", effectClass: "ambient", status: "available", inputSchema: {}, inputSchemaFingerprint: "d", resultSchema: {} },
+    { identity: "files/read", description: "Conflicting read.", origin: "extension", effectClass: "ambient", status: "available", inputSchema: {}, inputSchemaFingerprint: "e", resultSchema: {} },
+  ];
+  const catalog = discoverResources(root, extensionTools);
+
+  assert.equal(catalog.tools.find((tool) => tool.identity === "extension/search")?.origin, "extension");
+  assert.deepEqual(catalog.tools.filter((tool) => tool.identity === "files/read").map((tool) => tool.status), ["invalid", "invalid"]);
+  assert.equal(catalog.diagnostics.filter((item) => item.code === "tool.identity-collision").length, 1);
+  assert.deepEqual(resolveToolSelection(catalog.tools, ["files/read", "extension/search"]).tools.map((tool) => tool.identity), ["extension/search"]);
+  assert.deepEqual(resolveToolSelection(catalog.tools, ["files/read", "extension/search"]).unresolved, ["files/read"]);
 });
 
 test("marks every case-colliding Agent invalid and protects bundled identities", () => {

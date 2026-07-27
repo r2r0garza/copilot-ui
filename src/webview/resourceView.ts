@@ -1,5 +1,7 @@
 import type { Diagnostic, ResourceCatalogState, ResourceStatus } from "../features/resources";
 
+const AUTO_EXPAND_LIMIT = 8;
+
 export function renderResourceCatalog(state: ResourceCatalogState): string {
   const { catalog } = state;
   const resources = [...catalog.agents, ...catalog.skills, ...catalog.mcpServers, ...catalog.tools];
@@ -26,34 +28,54 @@ export function renderResourceCatalog(state: ResourceCatalogState): string {
         <div class="catalog-revision"><span>Catalog fingerprint</span><code>${state.fingerprint.slice(0, 12)}</code></div>
       </div>
       <div class="resource-grid">
-        ${resourceGroup("Agents", "Repository definitions", catalog.agents.map((agent) => resourceRow(
-          agent.identity,
-          agent.status,
-          agent.description,
-          agent.reason,
-          agent.model === null ? "Auto model" : Array.isArray(agent.model) ? `${agent.model.length} model choices` : String(agent.model),
-        )))}
-        ${resourceGroup("Skills", "Progressive instructions", catalog.skills.map((skill) => resourceRow(
-          skill.name,
-          skill.status,
-          skill.description,
-          skill.reason,
-          skill.userInvocable ? "User invocable" : "Model only",
-        )))}
-        ${resourceGroup("MCP", "Isolated server configurations", catalog.mcpServers.map((server) => resourceRow(
-          server.name,
-          server.status,
-          server.reason ?? `${server.transport?.toUpperCase() ?? "Unknown"} transport`,
-          server.reason,
-          server.requiresOAuth ? "OAuth" : server.inputIds.length ? `${server.inputIds.length} inputs` : "No inputs",
-        )))}
-        ${resourceGroup("Tools", "Bounded Workbench capabilities", catalog.tools.map((tool) => resourceRow(
-          tool.identity,
-          tool.status,
-          `${tool.effectClass} · ${tool.origin}`,
-          tool.reason,
-          tool.effectClass,
-        )))}
+        ${resourceGroup(
+          "Agents",
+          "Repository definitions",
+          catalog.agents.map((agent) => resourceRow(
+            agent.identity,
+            agent.status,
+            agent.description,
+            agent.reason,
+            agent.model === null ? "Auto model" : Array.isArray(agent.model) ? `${agent.model.length} model choices` : String(agent.model),
+          )),
+          catalog.agents.length <= AUTO_EXPAND_LIMIT,
+        )}
+        ${resourceGroup(
+          "Skills",
+          "Progressive instructions",
+          catalog.skills.map((skill) => resourceRow(
+            skill.name,
+            skill.status,
+            skill.description,
+            skill.reason,
+            skill.userInvocable ? "User invocable" : "Model only",
+          )),
+          catalog.skills.length <= AUTO_EXPAND_LIMIT,
+        )}
+        ${resourceGroup(
+          "MCP",
+          "Isolated server configurations",
+          catalog.mcpServers.map((server) => resourceRow(
+            server.name,
+            server.status,
+            server.reason ?? `${server.transport?.toUpperCase() ?? "Unknown"} transport`,
+            server.reason,
+            server.requiresOAuth ? "OAuth" : server.inputIds.length ? `${server.inputIds.length} inputs` : "No inputs",
+          )),
+          catalog.mcpServers.length <= AUTO_EXPAND_LIMIT,
+        )}
+        ${resourceGroup(
+          "Tools",
+          "Origin-preserving callable capabilities",
+          catalog.tools.map((tool) => resourceRow(
+            tool.identity,
+            tool.status,
+            tool.description,
+            tool.reason,
+            `${tool.effectClass} · ${tool.origin}`,
+          )),
+          catalog.tools.length <= AUTO_EXPAND_LIMIT,
+        )}
       </div>
       ${diagnostics(catalog.diagnostics)}
     `}
@@ -64,11 +86,11 @@ function countCell(label: string, count: number, status: ResourceStatus): string
   return `<div class="catalog-count"><span class="state-dot state-dot--${status}" aria-hidden="true"></span><strong>${count}</strong><span>${label}</span></div>`;
 }
 
-function resourceGroup(title: string, subtitle: string, rows: readonly string[]): string {
-  return `<article class="resource-group">
-    <header><div><h2>${title}</h2><p>${subtitle}</p></div><span class="resource-total">${rows.length}</span></header>
+function resourceGroup(title: string, subtitle: string, rows: readonly string[], expanded = true): string {
+  return `<details class="resource-group"${expanded ? " open" : ""}>
+    <summary><div><h2>${title}</h2><p>${subtitle}</p></div><span class="resource-group-meta"><span class="resource-total">${rows.length}</span><span class="resource-chevron" aria-hidden="true">⌄</span></span></summary>
     <div class="resource-list">${rows.join("") || `<p class="resource-empty">No ${title.toLowerCase()} discovered at the canonical location.</p>`}</div>
-  </article>`;
+  </details>`;
 }
 
 function resourceRow(name: string, status: ResourceStatus, description: string, reason: string | undefined, meta: string): string {

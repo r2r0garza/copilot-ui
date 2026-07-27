@@ -45,6 +45,7 @@ export class ResourceCatalogController implements ResourceService {
     workspaceRoot: string | null,
     workspaceName = workspaceRoot ? workspaceRoot.split(/[\\/]/).filter(Boolean).at(-1) ?? "Workspace" : "No workspace",
     private readonly now: () => string = () => new Date().toISOString(),
+    private readonly additionalTools: () => readonly ToolResource[] = () => [],
   ) {
     this.state = this.discover(workspaceRoot, workspaceName, workspaceRoot === null ? 0 : 1);
   }
@@ -91,7 +92,7 @@ export class ResourceCatalogController implements ResourceService {
   private discover(workspaceRoot: string | null, workspaceName: string, revision: number): ResourceCatalogState {
     const catalog = workspaceRoot === null
       ? { agents: [], skills: [], mcpServers: [], tools: [], diagnostics: [] }
-      : discoverResources(workspaceRoot);
+      : discoverResources(workspaceRoot, this.additionalTools());
     const fingerprint = createHash("sha256").update(JSON.stringify({ workspaceRoot, catalog })).digest("hex");
     return { workspaceRoot, workspaceName, revision, refreshedAt: this.now(), fingerprint, catalog };
   }
