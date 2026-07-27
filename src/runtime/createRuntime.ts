@@ -1,12 +1,13 @@
 import type { Disposable, Uri } from "vscode";
 
+import { WorkspaceStore } from "../adapters/sqlite/workspaceStore";
 import type { AgentService } from "../features/agents";
 import type { AttentionService } from "../features/attention";
 import type { ChatService } from "../features/chats";
 import type { ExecutionAuthorityService } from "../features/execution-authority";
 import type { MemoryService } from "../features/memory";
 import type { ResourceService } from "../features/resources";
-import type { TaskService } from "../features/tasks";
+import { createTaskService, type TaskService } from "../features/tasks";
 import type { ApplicationCommandHandler, ApplicationRequest, ApplicationResult, RuntimePorts } from "./application";
 
 export interface Runtime extends Disposable {
@@ -34,6 +35,11 @@ export interface CreateRuntimeOptions {
 export function createRuntime(_options: CreateRuntimeOptions): Runtime {
   const commandHandler = _options.commandHandler ?? unsupportedCommandHandler;
   const ports = _options.ports ?? createUnavailablePorts();
+  const taskStore = _options.workspaceStorageUri ? new WorkspaceStore(_options.workspaceStorageUri.fsPath) : undefined;
+  const tasks = createTaskService({
+    persistence: taskStore,
+    identity: () => ports.identity.next(),
+  });
 
   return {
     agents: unavailableService("agents"),
@@ -42,11 +48,12 @@ export function createRuntime(_options: CreateRuntimeOptions): Runtime {
     executionAuthority: unavailableService("execution authority"),
     memory: unavailableService("memory"),
     resources: _options.resources ?? unavailableService("resources"),
-    tasks: unavailableService("tasks"),
+    tasks,
     execute(request): Promise<ApplicationResult> {
       return commandHandler.execute(request, ports);
     },
     dispose(): void {
+      taskStore?.close();
       _options.resources?.dispose();
     },
   };
