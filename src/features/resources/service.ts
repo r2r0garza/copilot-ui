@@ -90,7 +90,7 @@ export class ResourceCatalogController implements ResourceService {
 
   private discover(workspaceRoot: string | null, workspaceName: string, revision: number): ResourceCatalogState {
     const catalog = workspaceRoot === null
-      ? { agents: [], skills: [], mcpServers: [], diagnostics: [] }
+      ? { agents: [], skills: [], mcpServers: [], tools: [], diagnostics: [] }
       : discoverResources(workspaceRoot);
     const fingerprint = createHash("sha256").update(JSON.stringify({ workspaceRoot, catalog })).digest("hex");
     return { workspaceRoot, workspaceName, revision, refreshedAt: this.now(), fingerprint, catalog };

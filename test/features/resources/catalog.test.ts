@@ -20,13 +20,19 @@ test("discovers valid repository resources while isolating invalid peers", () =>
   assert.equal(catalog.mcpServers.find((server) => server.name === "local")?.status, "available");
   assert.equal(catalog.mcpServers.find((server) => server.name === "unsupported")?.status, "unavailable");
   assert.equal(catalog.diagnostics.find((item) => item.code === "resource.unknown-field")?.severity, "warning");
+  assert.deepEqual(catalog.tools.map((tool) => tool.identity), ["files/list", "files/read", "files/write"]);
   assert.equal(loadSkillInstructions(root, "review"), "Read the selected diff.");
 });
 
 test("keeps explicit tool allowlists narrow and pins immutable snapshots", () => {
-  const tools: ToolResource[] = [{ identity: "files/read", origin: "workbench", status: "available", inputSchemaFingerprint: "a" }, { identity: "server/query", origin: "mcp", status: "available", inputSchemaFingerprint: "b" }];
+  const tools: ToolResource[] = [
+    { identity: "files/read", origin: "workbench", effectClass: "read", status: "available", inputSchema: {}, inputSchemaFingerprint: "a", resultSchema: {} },
+    { identity: "server/query", origin: "mcp", effectClass: "ambient", status: "available", inputSchema: {}, inputSchemaFingerprint: "b", resultSchema: {} },
+    { identity: "server/offline", origin: "mcp", effectClass: "ambient", status: "unavailable", inputSchema: {}, inputSchemaFingerprint: "c", resultSchema: {}, reason: "Offline." },
+  ];
   assert.deepEqual(selectTools(tools, ["server/*"]).map((tool) => tool.identity), ["server/query"]);
-  const catalog = { agents: [], skills: [], mcpServers: [], diagnostics: [] };
+  assert.deepEqual(selectTools(tools, ["files/read", "unknown/tool"]).map((tool) => tool.identity), ["files/read"]);
+  const catalog = { agents: [], skills: [], mcpServers: [], tools: [], diagnostics: [] };
   const snapshot = pinSnapshot(catalog, { identity: "a", description: "d", instructions: "i", model: null, tools: null, status: "available" }, "model-a", tools, "2026-07-25T00:00:00.000Z");
   assert.equal(snapshot.tools.length, 2); assert.equal(snapshot.effectiveModelId, "model-a");
 });

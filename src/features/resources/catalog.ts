@@ -3,6 +3,7 @@ import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { isAlias, isMap, isScalar, parseDocument, visit, type Node, type Pair } from "yaml";
 
+import { repositoryToolCatalog } from "../tools/repositoryTools";
 import { readMcpConfiguration, type McpTransport } from "./mcp";
 
 export type ResourceStatus = "available" | "unavailable" | "invalid";
@@ -48,14 +49,19 @@ export interface McpServer {
 export interface ToolResource {
   readonly identity: string;
   readonly origin: ToolOrigin;
+  readonly effectClass: "read" | "repository-write" | "ambient";
   readonly status: ResourceStatus;
+  readonly inputSchema: Readonly<Record<string, unknown>>;
   readonly inputSchemaFingerprint: string;
+  readonly resultSchema: Readonly<Record<string, unknown>>;
+  readonly reason?: string;
 }
 
 export interface ResourceCatalog {
   readonly agents: readonly AgentResource[];
   readonly skills: readonly SkillResource[];
   readonly mcpServers: readonly McpServer[];
+  readonly tools: readonly ToolResource[];
   readonly diagnostics: readonly Diagnostic[];
 }
 
@@ -93,7 +99,7 @@ export function discoverResources(root: string): ResourceCatalog {
   const mcp = readMcpConfiguration(join(root, ".vscode", "mcp.json"));
   diagnostics.push(...mcp.diagnostics);
   const mcpServers = mcp.servers;
-  return { agents, skills, mcpServers, diagnostics };
+  return { agents, skills, mcpServers, tools: repositoryToolCatalog, diagnostics };
 }
 
 /** Skill instructions are intentionally read only after selection. */
@@ -112,9 +118,10 @@ export function selectTools(available: readonly ToolResource[], allowlist: reado
 }
 
 export function pinSnapshot(catalog: ResourceCatalog, agent: AgentResource, effectiveModelId: string, tools: readonly ToolResource[], now = new Date().toISOString(), catalogRevision = 0): ResourceSnapshot {
-  const payload = JSON.stringify({ catalog, agent: agent.identity, effectiveModelId, tools });
+  const selectedTools = tools.filter((tool) => tool.status === "available");
+  const payload = JSON.stringify({ catalog, agent: agent.identity, effectiveModelId, tools: selectedTools });
   const catalogFingerprint = fingerprint(payload);
-  return { snapshotId: fingerprint(`${catalogRevision}:${now}:${payload}`), createdAt: now, catalogRevision, agentIdentity: agent.identity, effectiveModelId, tools: [...tools], catalogFingerprint };
+  return { snapshotId: fingerprint(`${catalogRevision}:${now}:${payload}`), createdAt: now, catalogRevision, agentIdentity: agent.identity, effectiveModelId, tools: selectedTools, catalogFingerprint };
 }
 
 function discoverAgents(directory: string, diagnostics: Diagnostic[]): AgentResource[] {

@@ -1,19 +1,13 @@
 import * as vscode from "vscode";
 
 import { WorkspaceStore } from "../adapters/sqlite/workspaceStore";
-import type { AgentResource, ResourceCatalogState } from "../features/resources";
+import { bundledOrchestrator, listChatAgents, resolveAvailableChatAgent } from "../features/chats";
+import type { ResourceCatalogState } from "../features/resources";
 import type { Runtime } from "../runtime/createRuntime";
+import { renderChatsView, type ChatViewState } from "./chatView";
 import { renderResourceCatalog } from "./resourceView";
 
 const VIEW_TYPE = "bridgit.workbench";
-const bundledOrchestrator: AgentResource = {
-  identity: "bundled:orchestrator",
-  description: "Bridgit’s bundled repository orchestrator.",
-  instructions: "Help the user work safely in the active repository.",
-  model: null,
-  tools: null,
-  status: "available",
-};
 
 export function createWorkbenchPanel(
   context: vscode.ExtensionContext,
@@ -30,28 +24,70 @@ export function createWorkbenchPanel(
   const getStore = (): WorkspaceStore => store ??= new WorkspaceStore((context.storageUri ?? context.globalStorageUri).fsPath);
   let selectedChatId: string | undefined;
   let showingTrash = false;
-  const currentState = (): ChatState => chatState(getStore(), selectedChatId, showingTrash);
-  const sendState = (): Thenable<boolean> => { const state = currentState(); selectedChatId = state.selectedChatId; return panel.webview.postMessage({ type: "chat-state", state }); };
-  let initialState: ChatState = { chats: [], selectedChatId: undefined, showingTrash: false, messages: [] };
+  let resourceState = _runtime.resources.getState();
+  let draftAgentIdentity = bundledOrchestrator.identity;
+  const currentState = (): ChatViewState => chatState(getStore(), selectedChatId, showingTrash, resourceState, draftAgentIdentity);
+  const sendState = (messageType: "chat-state" | "chat-resource-state" = "chat-state"): Thenable<boolean> => {
+    const state = currentState();
+    selectedChatId = state.selectedChatId;
+    return panel.webview.postMessage({ type: messageType, html: renderChatsView(state) });
+  };
+  let initialState: ChatViewState = {
+    chats: [],
+    selectedChatId: undefined,
+    showingTrash: false,
+    messages: [],
+    activeAgentIdentity: bundledOrchestrator.identity,
+    agents: listChatAgents(resourceState),
+    catalogRevision: resourceState.revision,
+    workspaceName: resourceState.workspaceName,
+  };
   try { initialState = currentState(); selectedChatId = initialState.selectedChatId; } catch { /* The panel remains usable and surfaces storage errors on Send. */ }
-  const initialResourceState = _runtime.resources.getState();
-  panel.webview.html = renderWorkbench(panel.webview, initialState, initialResourceState);
+  panel.webview.html = renderWorkbench(panel.webview, initialState, resourceState);
   const resourceSubscription = _runtime.resources.onDidChange((state) => {
+    resourceState = state;
     void panel.webview.postMessage({ type: "resource-state", html: renderResourceCatalog(state) });
+    void sendState("chat-resource-state");
   });
   panel.onDidDispose(() => resourceSubscription.dispose());
   panel.webview.onDidReceiveMessage(async (message: unknown) => {
     if (isResourceRefresh(message)) {
       const state = _runtime.resources.refresh();
+      resourceState = state;
       await panel.webview.postMessage({ type: "resource-state", html: renderResourceCatalog(state) });
+      await sendState("chat-resource-state");
+      return;
+    }
+    if (isAgentSelect(message)) {
+      try {
+        const agent = resolveAvailableChatAgent(resourceState, message.agentIdentity);
+        if (!agent) throw new Error("Select an available Agent from the active Resource Catalog.");
+        draftAgentIdentity = agent.identity;
+        const current = selectedChatId ? getStore().getChat(selectedChatId) : undefined;
+        if (current?.agentIdentity !== agent.identity) {
+          selectedChatId = getStore().createChat(agent.identity, null).chatId;
+          showingTrash = false;
+        }
+        await sendState();
+      } catch (error) {
+        await panel.webview.postMessage({ type: "chat-error", message: error instanceof Error ? error.message : "Unable to select this Agent." });
+      }
       return;
     }
     if (isChatAction(message)) {
       try {
         const authority = getStore(); const selected = selectedChatId;
-        if (message.action === "new") { selectedChatId = authority.createChat("bundled:orchestrator", null).chatId; showingTrash = false; }
+        if (message.action === "new") {
+          const agent = resolveAvailableChatAgent(resourceState, draftAgentIdentity) ?? bundledOrchestrator;
+          draftAgentIdentity = agent.identity;
+          selectedChatId = authority.createChat(agent.identity, null).chatId;
+          showingTrash = false;
+        }
         else if (message.action === "toggle-trash") showingTrash = !showingTrash;
-        else if (message.action === "select") { if (message.chatId && authority.getChat(message.chatId)) selectedChatId = message.chatId; }
+        else if (message.action === "select") {
+          const chat = message.chatId ? authority.getChat(message.chatId) : undefined;
+          if (chat) { selectedChatId = chat.chatId; draftAgentIdentity = chat.agentIdentity; }
+        }
         else if (!selected) throw new Error("select-or-create-a-chat-first");
         else if (message.action === "fork") { selectedChatId = authority.forkChat(selected, authority.getChat(selected)?.agentIdentity ?? "bundled:orchestrator").chatId; showingTrash = false; }
         else if (message.action === "trash") { authority.trashChat(selected); selectedChatId = authority.listChats()[0]?.chatId; showingTrash = false; }
@@ -69,19 +105,24 @@ export function createWorkbenchPanel(
     try {
       const authority = getStore();
       const chat = selectedChatId ? authority.getChat(selectedChatId) : undefined;
-      const targetChat = chat ?? authority.createChat("bundled:orchestrator", null);
+      const targetChat = chat ?? authority.createChat(draftAgentIdentity, null);
       selectedChatId = targetChat.chatId;
+      const agent = resolveAvailableChatAgent(resourceState, targetChat.agentIdentity);
+      if (!agent) throw new Error("This Chat’s Agent is no longer available. Select an available Agent to start a new Chat.");
       const turn = authority.submitTurn(targetChat.chatId, content);
       const [model] = await vscode.lm.selectChatModels();
       if (!model) throw new Error("No chat model is available. Sign in to GitHub Copilot and try again.");
       if (targetChat.title === "New chat") authority.setChatTitle(targetChat.chatId, await generateChatTitle(model, content));
       const attempt = authority.createResponseAttempt(turn.turnId, model.id, undefined, model.id);
       activeAttemptId = attempt.attemptId;
-      const resourceSnapshot = _runtime.resources.createSnapshot(bundledOrchestrator, model.id, []);
+      const resourceSnapshot = _runtime.resources.createSnapshot(agent, model.id, []);
       authority.pinResourceSnapshot(attempt.attemptId, JSON.stringify(resourceSnapshot), resourceSnapshot.createdAt);
       authority.transitionAttempt(attempt.attemptId, "running");
       const cancellation = new vscode.CancellationTokenSource();
-      const response = await model.sendRequest([vscode.LanguageModelChatMessage.User(content)], {}, cancellation.token);
+      const response = await model.sendRequest([
+        vscode.LanguageModelChatMessage.User(`Follow these repository Agent instructions for this response:\n\n${agent.instructions}`),
+        vscode.LanguageModelChatMessage.User(content),
+      ], {}, cancellation.token);
       let output = "";
       for await (const fragment of response.text) { output += fragment; authority.checkpointOutput(turn.turnId, output); await panel.webview.postMessage({ type: "chat-stream", content: output }); }
       authority.appendOutput(turn.turnId, output || "The model returned no visible text.");
@@ -97,7 +138,7 @@ export function createWorkbenchPanel(
   return panel;
 }
 
-function renderWorkbench(webview: vscode.Webview, state: ChatState, resources: ResourceCatalogState): string {
+function renderWorkbench(webview: vscode.Webview, state: ChatViewState, resources: ResourceCatalogState): string {
   const nonce = createNonce();
 
   return `<!doctype html>
@@ -143,29 +184,69 @@ function renderWorkbench(webview: vscode.Webview, state: ChatState, resources: R
       .subtask { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 9px 0; border-bottom: 1px solid var(--vscode-panel-border); }
       .subtask:last-child { border-bottom: 0; }
       .subtask small { color: var(--vscode-descriptionForeground); }
-      .chat-layout { display: flex; flex-direction: column; gap: 16px; max-width: 800px; }
-      .chat-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; }
-      .chat-actions, .chat-toolbar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-      .chat-shell { display: grid; grid-template-columns: 190px minmax(0, 1fr); gap: 14px; height: calc(100vh - 240px); min-height: 0; }
-      .session-list { padding: 8px; overflow-y: auto; border: 1px solid var(--vscode-panel-border); background: var(--vscode-sideBar-background); }
-      .session-item { display: flex; width: 100%; justify-content: space-between; gap: 8px; padding: 9px; border: 0; border-radius: 3px; background: transparent; text-align: left; cursor: pointer; }
-      .session-item[aria-current="true"] { background: var(--vscode-list-activeSelectionBackground); color: var(--vscode-list-activeSelectionForeground); }
-      .session-item small, .muted { color: var(--vscode-descriptionForeground); }
+      .chat-view { height: calc(100vh - 44px); max-width: 1280px; overflow-y: auto; padding: 0 2px 42px; scrollbar-gutter: stable; }
+      .chat-masthead { display: flex; align-items: flex-start; justify-content: space-between; gap: 24px; }
+      .chat-masthead .lede { margin-bottom: 22px; }
+      .chat-actions, .chat-toolbar { display: flex; align-items: center; justify-content: flex-end; gap: 7px; flex-wrap: wrap; }
+      .chat-actions { margin-top: 19px; }
+      .new-chat-action { display: flex; align-items: center; gap: 5px; white-space: nowrap; }
+      .chat-context-strip { display: grid; grid-template-columns: minmax(280px, 1.65fr) minmax(150px, .7fr) minmax(190px, .9fr); margin-bottom: 14px; border: 1px solid var(--vscode-panel-border); background: var(--vscode-sideBar-background); }
+      .agent-picker, .context-cell { min-height: 82px; display: flex; flex-direction: column; justify-content: center; gap: 5px; padding: 12px 16px; border-right: 1px solid var(--vscode-panel-border); }
+      .context-cell:last-child { border-right: 0; }
+      .context-label { color: var(--vscode-descriptionForeground); font-size: 9px; font-weight: 700; letter-spacing: .11em; text-transform: uppercase; }
+      .context-value { font-size: 14px; font-weight: 650; }
+      .context-detail { min-width: 0; overflow: hidden; color: var(--vscode-descriptionForeground); font-size: 10px; line-height: 1.35; text-overflow: ellipsis; white-space: nowrap; }
+      .agent-select-wrap { display: grid; grid-template-columns: 8px minmax(0, 1fr); gap: 10px; align-items: center; }
+      .agent-select-wrap select { width: 100%; min-width: 0; padding: 0 24px 0 0; border: 0; outline: 0; color: var(--vscode-foreground); background: transparent; font: 650 14px var(--vscode-font-family); cursor: pointer; }
+      .agent-select-wrap select:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: 3px; }
+      .chat-shell { min-height: 430px; height: calc(100vh - 300px); display: grid; grid-template-columns: 218px minmax(0, 1fr); border: 1px solid var(--vscode-panel-border); background: var(--vscode-editorWidget-background); }
+      .session-panel { min-width: 0; display: flex; flex-direction: column; border-right: 1px solid var(--vscode-panel-border); background: var(--vscode-sideBar-background); }
+      .session-panel-header, .conversation-header { min-height: 64px; display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 11px 13px; border-bottom: 1px solid var(--vscode-panel-border); background: linear-gradient(135deg, color-mix(in srgb, var(--vscode-sideBar-background) 88%, transparent), transparent); }
+      .session-panel-header .eyebrow { margin-bottom: 2px; font-size: 9px; }
+      .session-panel-header h2 { margin: 0; font-size: 13px; font-weight: 650; }
+      .session-list { min-height: 0; padding: 7px; overflow-y: auto; }
+      .session-item { width: 100%; display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 10px 9px; border: 0; border-left: 2px solid transparent; background: transparent; text-align: left; cursor: pointer; }
+      .session-item:hover { background: var(--vscode-list-hoverBackground); }
+      .session-item[aria-current="true"] { border-left-color: var(--vscode-focusBorder); background: var(--vscode-list-activeSelectionBackground); color: var(--vscode-list-activeSelectionForeground); }
+      .session-copy { min-width: 0; display: grid; gap: 4px; }
+      .session-copy strong { overflow: hidden; font-size: 12px; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
+      .session-copy small { overflow: hidden; color: var(--vscode-descriptionForeground); font: 9px var(--vscode-editor-font-family); text-overflow: ellipsis; white-space: nowrap; }
+      .session-tag { padding: 2px 4px; border: 1px solid var(--vscode-panel-border); color: var(--vscode-descriptionForeground); font-size: 8px; letter-spacing: .06em; text-transform: uppercase; }
+      .session-empty { display: grid; place-items: center; gap: 8px; padding: 38px 10px; color: var(--vscode-descriptionForeground); text-align: center; }
+      .session-empty > span { font-size: 20px; }
+      .session-empty p { margin: 0; font-size: 11px; }
+      .conversation-panel { min-width: 0; min-height: 0; display: grid; grid-template-rows: auto minmax(0, 1fr) auto auto; }
+      .conversation-header { padding-inline: 16px; }
+      .conversation-identity { min-width: 0; display: flex; align-items: center; gap: 10px; }
+      .conversation-identity > div { min-width: 0; display: grid; gap: 3px; }
+      .conversation-identity strong { overflow: hidden; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
+      .agent-monogram { width: 30px; height: 30px; display: grid; flex: 0 0 auto; place-items: center; border: 1px solid var(--vscode-focusBorder); color: var(--vscode-focusBorder); background: color-mix(in srgb, var(--vscode-focusBorder) 7%, transparent); font: 700 10px var(--vscode-editor-font-family); }
       .quiet-action, .danger-action { padding: 7px 10px; border: 1px solid var(--vscode-panel-border); border-radius: 3px; background: transparent; cursor: pointer; }
+      .quiet-action:hover, .danger-action:hover { background: var(--vscode-list-hoverBackground); }
       .danger-action { color: var(--vscode-errorForeground); }
       .toolbar-input { min-width: 190px; padding: 7px 9px; color: var(--vscode-input-foreground); border: 1px solid var(--vscode-focusBorder); border-radius: 3px; background: var(--vscode-input-background); font: inherit; }
-      .transcript { min-height: 0; display: flex; flex: 1; flex-direction: column; align-items: flex-start; gap: 12px; padding: 18px; overflow-y: auto; border: 1px solid var(--vscode-panel-border); background: var(--vscode-editorWidget-background); }
-      .message { width: fit-content; max-width: min(78%, 620px); padding: 10px 13px; border-radius: 5px; border-left: 2px solid var(--vscode-testing-iconPassed); background: var(--vscode-textBlockQuote-background); white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.55; }
-      .message.user { align-self: flex-end; border-left: 0; border-right: 2px solid var(--vscode-focusBorder); background: var(--vscode-input-background); }
+      .transcript { min-height: 0; display: flex; flex-direction: column; align-items: flex-start; gap: 15px; padding: 22px; overflow-y: auto; background-image: linear-gradient(color-mix(in srgb, var(--vscode-panel-border) 25%, transparent) 1px, transparent 1px); background-size: 100% 42px; }
+      .message { width: fit-content; max-width: min(82%, 680px); flex: 0 0 auto; border: 1px solid var(--vscode-panel-border); border-left: 2px solid var(--vscode-testing-iconPassed); background: color-mix(in srgb, var(--vscode-textBlockQuote-background) 82%, var(--vscode-editor-background)); overflow-wrap: anywhere; }
+      .message header { padding: 6px 11px; border-bottom: 1px solid var(--vscode-panel-border); color: var(--vscode-descriptionForeground); font: 9px var(--vscode-editor-font-family); letter-spacing: .08em; }
+      .message > div { padding: 9px 11px 10px; white-space: pre-wrap; line-height: 1.5; }
+      .message.user { align-self: flex-end; border-left: 1px solid var(--vscode-panel-border); border-right: 2px solid var(--vscode-focusBorder); background: var(--vscode-input-background); }
       .message.assistant { align-self: flex-start; }
-      .composer { display: grid; grid-template-columns: 1fr auto; gap: 10px; }
-      .chat-error { min-height: 18px; margin: 0; color: var(--vscode-errorForeground); font-size: 12px; }
-      textarea { min-height: 42px; max-height: 322px; resize: none; overflow-y: hidden; padding: 10px; color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border); border-radius: 4px; background: var(--vscode-input-background); font: inherit; line-height: 21px; }
+      .transcript-empty { width: min(460px, 90%); margin: auto; text-align: center; }
+      .empty-glyph { display: block; margin-bottom: 13px; color: var(--vscode-focusBorder); font-size: 29px; }
+      .transcript-empty h2 { margin: 0 0 8px; font-size: 16px; font-weight: 600; }
+      .transcript-empty p { margin: 0; color: var(--vscode-descriptionForeground); font-size: 11px; line-height: 1.55; }
+      .composer { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 10px; padding: 12px 14px 14px; border-top: 1px solid var(--vscode-panel-border); background: var(--vscode-sideBar-background); }
+      .composer-field { min-width: 0; display: grid; gap: 5px; }
+      .composer-hint { color: var(--vscode-descriptionForeground); font-size: 9px; }
+      .composer-hint strong { color: var(--vscode-foreground); font-weight: 500; }
+      .chat-error { min-height: 0; margin: 0; padding: 0 14px; color: var(--vscode-errorForeground); background: var(--vscode-sideBar-background); font-size: 11px; }
+      .chat-error:not(:empty) { padding-top: 9px; }
+      textarea { min-height: 42px; max-height: 180px; resize: none; overflow-y: hidden; padding: 10px; color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border); border-radius: 2px; background: var(--vscode-input-background); font: inherit; line-height: 21px; }
       textarea:focus { outline: 1px solid var(--vscode-focusBorder); outline-offset: -1px; }
       .send { align-self: end; padding: 9px 14px; color: var(--vscode-button-foreground); border: 0; border-radius: 2px; background: var(--vscode-button-background); cursor: pointer; font-weight: 600; }
-      .view#chats { max-width: none; height: calc(100vh - 108px); min-height: 0; }
-      .chat-layout { width: min(100%, 1280px); max-width: none; min-height: 0; }
-      .composer { position: sticky; bottom: 0; padding-top: 10px; background: var(--vscode-editor-background); }
+      .send:hover { background: var(--vscode-button-hoverBackground); }
+      .send:disabled, textarea:disabled { cursor: not-allowed; opacity: .55; }
+      .composer-send { display: flex; align-items: center; gap: 7px; }
       .resource-view { height: calc(100vh - 44px); max-width: 1280px; overflow-y: auto; padding: 0 2px 48px; scrollbar-gutter: stable; }
       .resource-masthead { display: flex; align-items: flex-start; justify-content: space-between; gap: 24px; }
       .resource-masthead .lede { margin-bottom: 22px; }
@@ -180,7 +261,7 @@ function renderWorkbench(webview: vscode.Webview, state: ChatState, resources: R
       .state-dot--available { background: var(--vscode-testing-iconPassed); box-shadow: 0 0 0 3px color-mix(in srgb, var(--vscode-testing-iconPassed) 16%, transparent); }
       .state-dot--unavailable { background: var(--vscode-editorWarning-foreground); box-shadow: 0 0 0 3px color-mix(in srgb, var(--vscode-editorWarning-foreground) 16%, transparent); }
       .state-dot--invalid { background: var(--vscode-errorForeground); box-shadow: 0 0 0 3px color-mix(in srgb, var(--vscode-errorForeground) 16%, transparent); }
-      .resource-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; }
+      .resource-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px; }
       .resource-group, .diagnostic-ledger { border: 1px solid var(--vscode-panel-border); background: var(--vscode-editorWidget-background); }
       .resource-group > header, .diagnostic-ledger > header { display: flex; align-items: center; justify-content: space-between; gap: 12px; min-height: 69px; padding: 13px 16px; border-bottom: 1px solid var(--vscode-panel-border); background: linear-gradient(135deg, color-mix(in srgb, var(--vscode-sideBar-background) 88%, transparent), transparent); }
       .resource-group h2, .diagnostic-ledger h2 { margin: 0; font-size: 14px; font-weight: 650; letter-spacing: .01em; }
@@ -209,8 +290,9 @@ function renderWorkbench(webview: vscode.Webview, state: ChatState, resources: R
       .diagnostic code { color: var(--vscode-descriptionForeground); font-size: 10px; }
       .diagnostic strong { overflow: hidden; text-overflow: ellipsis; text-align: right; white-space: nowrap; }
       .diagnostic p { grid-column: 1 / -1; margin: 1px 0 0; color: var(--vscode-descriptionForeground); font-size: 11px; line-height: 1.45; }
-      @media (max-width: 980px) { .resource-grid { grid-template-columns: 1fr; } .resource-list { min-height: auto; } }
-      @media (max-width: 700px) { .workbench { grid-template-columns: 58px minmax(0, 1fr); } .brand span, .nav-label, .rail-footer { display: none; } .brand { justify-content: center; margin-inline: 0; } .nav-button { justify-content: center; padding-inline: 4px; } .board, .chat-shell { grid-template-columns: 1fr; } .session-list { max-height: 110px; } .card--wide { grid-column: auto; } .content { padding: 24px 18px; } .chat-heading { display: block; } .resource-masthead { display: block; } .refresh-action { margin: 0 0 16px; } .catalog-strip { grid-template-columns: repeat(3, 1fr); } .catalog-revision { grid-column: 1 / -1; border-top: 1px solid var(--vscode-panel-border); } .diagnostic-list { grid-template-columns: 1fr; } .diagnostic { border-right: 0; } }
+      @media (max-width: 980px) { .resource-grid { grid-template-columns: 1fr; } .resource-list { min-height: auto; } .chat-context-strip { grid-template-columns: 1fr 1fr; } .agent-picker { grid-column: 1 / -1; border-right: 0; border-bottom: 1px solid var(--vscode-panel-border); } }
+      @media (max-width: 760px) { .workbench { grid-template-columns: 58px minmax(0, 1fr); } .brand span, .nav-label, .rail-footer { display: none; } .brand { justify-content: center; margin-inline: 0; } .nav-button { justify-content: center; padding-inline: 4px; } .board { grid-template-columns: 1fr; } .card--wide { grid-column: auto; } .content { padding: 24px 18px; } .chat-masthead, .resource-masthead { display: block; } .chat-actions { justify-content: flex-start; margin: 0 0 16px; } .refresh-action { margin: 0 0 16px; } .chat-shell { height: auto; grid-template-columns: 1fr; } .session-panel { max-height: 190px; border-right: 0; border-bottom: 1px solid var(--vscode-panel-border); } .conversation-panel { min-height: 440px; } .catalog-strip { grid-template-columns: repeat(3, 1fr); } .catalog-revision { grid-column: 1 / -1; border-top: 1px solid var(--vscode-panel-border); } .diagnostic-list { grid-template-columns: 1fr; } .diagnostic { border-right: 0; } }
+      @media (max-width: 480px) { .chat-context-strip { grid-template-columns: 1fr; } .agent-picker, .context-cell { grid-column: auto; border-right: 0; border-bottom: 1px solid var(--vscode-panel-border); } .context-cell:last-child { border-bottom: 0; } .conversation-header { align-items: flex-start; } .chat-toolbar { justify-content: flex-start; } .message { max-width: 94%; } .composer { grid-template-columns: 1fr; } .composer-send { justify-content: center; } }
     </style>
   </head>
   <body>
@@ -229,7 +311,7 @@ function renderWorkbench(webview: vscode.Webview, state: ChatState, resources: R
       </aside>
       <section class="content">
         ${tasksView()}
-        ${chatsView(state)}
+        ${renderChatsView(state)}
         ${emptyView("activity", "Activity", "Meaningful outcomes", "Recovery notices, approvals, and execution outcomes will form a concise chronological record here.")}
         ${renderResourceCatalog(resources)}
         ${emptyView("memory", "Memory", "Explicit, inspectable memory", "Project and Personal Memory stay separate from session-local ledgers and require explicit confirmation.")}
@@ -244,33 +326,64 @@ function renderWorkbench(webview: vscode.Webview, state: ChatState, resources: R
         for (const view of document.querySelectorAll('.view')) view.dataset.active = String(view.id === target);
         if (target === 'chats') requestAnimationFrame(scrollToLatest);
       });
-      const vscode = acquireVsCodeApi(); const form = document.querySelector('#chat-form'); const input = document.querySelector('#chat-input'); const error = document.querySelector('#chat-error'); const transcript = () => document.querySelector('#transcript'); const scrollToLatest = () => { const element = transcript(); if (element) element.scrollTop = element.scrollHeight; }; const escapeHtml = (value) => value.replace(/[&<>]/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
-      const resizeComposer = () => { input.style.height = 'auto'; input.style.height = Math.min(input.scrollHeight, 322) + 'px'; input.style.overflowY = input.scrollHeight > 322 ? 'auto' : 'hidden'; };
-      input?.addEventListener('input', resizeComposer);
-      input?.addEventListener('keydown', (event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); form?.requestSubmit(); } });
-      form?.addEventListener('submit', (event) => { event.preventDefault(); const content = input.value; const element = transcript(); if (content.trim() && element) { element.innerHTML += '<div class="message user"><strong>you</strong><br>' + escapeHtml(content) + '</div><div id="streaming-response" class="message assistant"><strong>Bridgit</strong><br><span></span></div>'; scrollToLatest(); error.textContent = 'Sending…'; vscode.postMessage({ type: 'chat-send', content }); input.value = ''; resizeComposer(); } });
+      const vscode = acquireVsCodeApi(); const transcript = () => document.querySelector('#transcript'); const chatError = () => document.querySelector('#chat-error'); const scrollToLatest = () => { const element = transcript(); if (element) element.scrollTop = element.scrollHeight; }; const escapeHtml = (value) => value.replace(/[&<>]/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+      const resizeComposer = (input) => { input.style.height = 'auto'; input.style.height = Math.min(input.scrollHeight, 180) + 'px'; input.style.overflowY = input.scrollHeight > 180 ? 'auto' : 'hidden'; };
+      document.addEventListener('input', (event) => { if (event.target instanceof HTMLTextAreaElement && event.target.id === 'chat-input') resizeComposer(event.target); });
+      document.addEventListener('keydown', (event) => { if (event.key === 'Enter' && !event.shiftKey && event.target instanceof HTMLTextAreaElement && event.target.id === 'chat-input') { event.preventDefault(); event.target.form?.requestSubmit(); } });
+      document.addEventListener('submit', (event) => { if (!(event.target instanceof HTMLFormElement) || event.target.id !== 'chat-form') return; event.preventDefault(); const input = document.querySelector('#chat-input'); const element = transcript(); const error = chatError(); const agent = document.querySelector('.conversation-identity strong')?.textContent || 'Agent'; if (input instanceof HTMLTextAreaElement && input.value.trim() && element) { const content = input.value; element.querySelector('.transcript-empty')?.remove(); element.innerHTML += '<article class="message user"><header><span>YOU</span></header><div>' + escapeHtml(content) + '</div></article><article id="streaming-response" class="message assistant"><header><span>' + escapeHtml(agent) + '</span></header><div></div></article>'; scrollToLatest(); if (error) error.textContent = 'Sending…'; vscode.postMessage({ type: 'chat-send', content }); input.value = ''; resizeComposer(input); } });
+      document.addEventListener('change', (event) => { if (event.target instanceof HTMLSelectElement && event.target.id === 'chat-agent-select') vscode.postMessage({ type: 'chat-agent-select', agentIdentity: event.target.value }); });
       const saveRename = () => { const title = document.querySelector('#rename-input')?.value || ''; vscode.postMessage({ type: 'chat-action', action: 'rename', title }); };
       document.addEventListener('click', (event) => { if (event.target instanceof Element && event.target.closest('#resource-refresh')) vscode.postMessage({ type: 'resource-refresh' }); });
       document.addEventListener('click', (event) => { if (!(event.target instanceof Element)) return; const control = event.target.closest('[data-chat-action]'); if (!control) return; const action = control.dataset.chatAction; const toolbar = document.querySelector('#chat-toolbar'); const selectedTitle = document.querySelector('.session-item[aria-current="true"] span')?.textContent || ''; if (action === 'rename') { if (toolbar) { toolbar.innerHTML = '<input id="rename-input" class="toolbar-input" aria-label="Chat title" value="' + escapeHtml(selectedTitle) + '"><button data-chat-action="rename-save" class="send" type="button">Save</button><button data-chat-action="rename-cancel" class="quiet-action" type="button">Cancel</button>'; const input = document.querySelector('#rename-input'); input?.focus(); input?.select(); } return; } if (action === 'rename-cancel') { vscode.postMessage({ type: 'chat-action', action: 'select' }); return; } if (action === 'rename-save') { saveRename(); return; } if (action === 'delete') { if (toolbar) toolbar.innerHTML = '<span class="muted">Delete this Chat permanently?</span><button data-chat-action="delete-confirm" class="danger-action" type="button">Confirm delete</button><button data-chat-action="delete-cancel" class="quiet-action" type="button">Cancel</button>'; return; } if (action === 'delete-cancel') { vscode.postMessage({ type: 'chat-action', action: 'select' }); return; } if (action === 'delete-confirm') { vscode.postMessage({ type: 'chat-action', action: 'delete' }); return; } vscode.postMessage({ type: 'chat-action', action, chatId: control.dataset.chatId }); });
       document.addEventListener('keydown', (event) => { if (event.key === 'Enter' && event.target instanceof HTMLInputElement && event.target.id === 'rename-input') { event.preventDefault(); saveRename(); } });
-      const renderState = (state) => { const sessions = document.querySelector('#session-list'); const toolbar = document.querySelector('#chat-toolbar'); const trashToggle = document.querySelector('#trash-toggle'); const element = transcript(); if (trashToggle) trashToggle.textContent = state.showingTrash ? 'Back' : 'Trash'; if (sessions) sessions.innerHTML = state.chats.map((chat) => '<button class="session-item" data-chat-action="select" data-chat-id="' + chat.chatId + '" aria-current="' + String(chat.chatId === state.selectedChatId) + '"><span>' + chat.label + '</span>' + (chat.forked ? '<small>Fork</small>' : '') + '</button>').join('') || '<p class="muted">' + (state.showingTrash ? 'Trash is empty.' : 'No chats yet.') + '</p>'; if (toolbar) toolbar.innerHTML = !state.selectedChatId ? '<span class="muted">Create a Chat to begin.</span>' : state.showingTrash ? '<button data-chat-action="restore" class="quiet-action" type="button">Restore</button><button data-chat-action="delete" class="danger-action" type="button">Delete permanently</button>' : '<button data-chat-action="rename" class="quiet-action" type="button">Rename</button><button data-chat-action="fork" class="quiet-action" type="button">Fork</button><button data-chat-action="trash" class="quiet-action" type="button">Move to Trash</button>'; if (element) element.innerHTML = state.messages.map((item) => '<div class="message ' + item.role + '"><strong>' + (item.role === 'user' ? 'you' : 'Bridgit') + '</strong><br>' + escapeHtml(item.content) + '</div>').join('') || '<p class="muted">Start a durable Chat session below.</p>'; scrollToLatest(); error.textContent = ''; };
-      window.addEventListener('message', (event) => { const message = event.data; if (message.type === 'chat-state') renderState(message.state); if (message.type === 'chat-stream') { const stream = document.querySelector('#streaming-response span'); if (stream) { stream.textContent = message.content; scrollToLatest(); } } if (message.type === 'chat-error') error.textContent = message.message; if (message.type === 'resource-state') { const current = document.querySelector('#agents'); if (current) { const active = current.dataset.active; const template = document.createElement('template'); template.innerHTML = message.html; const next = template.content.firstElementChild; if (next) { next.dataset.active = active; current.replaceWith(next); } } } });
+      const replaceView = (id, html) => { const current = document.querySelector('#' + id); if (!current) return; const active = current.dataset.active; const template = document.createElement('template'); template.innerHTML = html; const next = template.content.firstElementChild; if (next) { next.dataset.active = active; current.replaceWith(next); } };
+      const refreshChatResources = (html) => { const prior = document.querySelector('#chat-input'); const draft = prior instanceof HTMLTextAreaElement ? prior.value : ''; const focused = prior === document.activeElement; replaceView('chats', html); const next = document.querySelector('#chat-input'); if (next instanceof HTMLTextAreaElement && !next.disabled) { next.value = draft; resizeComposer(next); if (focused) next.focus(); } };
+      window.addEventListener('message', (event) => { const message = event.data; if (message.type === 'chat-state') { replaceView('chats', message.html); scrollToLatest(); } if (message.type === 'chat-resource-state') refreshChatResources(message.html); if (message.type === 'chat-stream') { const stream = document.querySelector('#streaming-response > div'); if (stream) { stream.textContent = message.content; scrollToLatest(); } } if (message.type === 'chat-error') { const error = chatError(); if (error) error.textContent = message.message; } if (message.type === 'resource-state') replaceView('agents', message.html); });
     </script>
   </body>
 </html>`;
 }
 
-interface ChatState { readonly chats: readonly { readonly chatId: string; readonly label: string; readonly trashed: boolean; readonly forked: boolean }[]; readonly selectedChatId: string | undefined; readonly showingTrash: boolean; readonly messages: readonly { readonly role: "user" | "assistant"; readonly content: string }[]; }
-function chatState(store: WorkspaceStore, requestedChatId: string | undefined, showingTrash: boolean): ChatState { const chats = store.listChats(true).filter((chat) => showingTrash ? Boolean(chat.trashedAt) : !chat.trashedAt); const selectedChatId = chats.some((chat) => chat.chatId === requestedChatId) ? requestedChatId : chats[0]?.chatId; const chat = selectedChatId ? store.getChat(selectedChatId) : undefined; const messages = chat ? [...store.listTurns(chat.chatId).map((turn) => ({ role: "user" as const, content: turn.content, createdAt: turn.submittedAt })), ...store.listOutputs(chat.chatId).map((output) => ({ role: "assistant" as const, content: output.content, createdAt: output.createdAt }))].sort((left, right) => left.createdAt.localeCompare(right.createdAt)) : []; return { chats: chats.map((item) => ({ chatId: item.chatId, label: item.title, trashed: Boolean(item.trashedAt), forked: Boolean(item.originChatId) })), selectedChatId, showingTrash, messages: messages.map(({ role, content }) => ({ role, content })) }; }
-function chatsView(state: ChatState): string { return `<section id="chats" class="view" data-active="false"><p class="eyebrow">Session-first conversations</p><div class="chat-heading"><div><h1>Chats</h1><p class="lede">Your messages and model responses are stored locally and rebuild after reload.</p></div><div class="chat-actions"><button data-chat-action="new" class="send" type="button">New chat</button><button id="trash-toggle" data-chat-action="toggle-trash" class="quiet-action" type="button">${state.showingTrash ? "Back" : "Trash"}</button></div></div><div class="chat-shell"><aside id="session-list" class="session-list">${renderSessions(state)}</aside><div class="chat-layout"><div id="chat-toolbar" class="chat-toolbar">${renderToolbar(state)}</div><div id="transcript" class="transcript">${renderMessages(state.messages)}</div><p id="chat-error" class="chat-error" role="status"></p><form id="chat-form" class="composer"><textarea id="chat-input" aria-label="Chat message" aria-multiline="true" rows="1" placeholder="Message Bridgit…"></textarea><button class="send" type="submit">Send</button></form></div></div></section>`; }
-function renderSessions(state: ChatState): string { return state.chats.map((chat) => `<button class="session-item" data-chat-action="select" data-chat-id="${chat.chatId}" aria-current="${String(chat.chatId === state.selectedChatId)}"><span>${chat.label}</span>${chat.forked ? "<small>Fork</small>" : ""}</button>`).join("") || `<p class="muted">${state.showingTrash ? "Trash is empty." : "No chats yet."}</p>`; }
-function renderToolbar(state: ChatState): string { if (!state.selectedChatId) return "<span class=\"muted\">Create a Chat to begin.</span>"; return state.showingTrash ? `<button data-chat-action="restore" class="quiet-action" type="button">Restore</button><button data-chat-action="delete" class="danger-action" type="button">Delete permanently</button>` : `<button data-chat-action="rename" class="quiet-action" type="button">Rename</button><button data-chat-action="fork" class="quiet-action" type="button">Fork</button><button data-chat-action="trash" class="quiet-action" type="button">Move to Trash</button>`; }
-function renderMessages(messages: ChatState["messages"]): string { return messages.map((item) => `<div class="message ${item.role}"><strong>${item.role === "user" ? "you" : "Bridgit"}</strong><br>${escapeHtml(item.content)}</div>`).join("") || "<p class=\"muted\">Start a durable Chat session below.</p>"; }
+function chatState(
+  store: WorkspaceStore,
+  requestedChatId: string | undefined,
+  showingTrash: boolean,
+  resources: ResourceCatalogState,
+  draftAgentIdentity: string,
+): ChatViewState {
+  const chats = store.listChats(true).filter((chat) => showingTrash ? Boolean(chat.trashedAt) : !chat.trashedAt);
+  const selectedChatId = chats.some((chat) => chat.chatId === requestedChatId) ? requestedChatId : chats[0]?.chatId;
+  const chat = selectedChatId ? store.getChat(selectedChatId) : undefined;
+  const activeAgentIdentity = chat?.agentIdentity
+    ?? resolveAvailableChatAgent(resources, draftAgentIdentity)?.identity
+    ?? bundledOrchestrator.identity;
+  const messages = chat ? [
+    ...store.listTurns(chat.chatId).map((turn) => ({ role: "user" as const, content: turn.content, createdAt: turn.submittedAt })),
+    ...store.listOutputs(chat.chatId).map((output) => ({ role: "assistant" as const, content: output.content, createdAt: output.createdAt })),
+  ].sort((left, right) => left.createdAt.localeCompare(right.createdAt)) : [];
+  return {
+    chats: chats.map((item) => ({
+      chatId: item.chatId,
+      label: item.title,
+      agentIdentity: item.agentIdentity,
+      trashed: Boolean(item.trashedAt),
+      forked: Boolean(item.originChatId),
+    })),
+    selectedChatId,
+    showingTrash,
+    messages: messages.map(({ role, content }) => ({ role, content })),
+    activeAgentIdentity,
+    agents: listChatAgents(resources),
+    catalogRevision: resources.revision,
+    workspaceName: resources.workspaceName,
+  };
+}
 async function generateChatTitle(model: vscode.LanguageModelChat, firstMessage: string): Promise<string> { try { const prompt = `Write a short, descriptive conversation title based on the first user message below. Aim for 5 to 7 words; never use more than 7. Return only the title, with no labels, quotes, or explanation.\n\n${firstMessage}`; const response = await model.sendRequest([vscode.LanguageModelChatMessage.User(prompt)], {}); let title = ""; for await (const fragment of response.text) title += fragment; const words = title.replace(/["'`*_#.:!?]/g, "").replace(/\s+/g, " ").trim().split(" ").filter(Boolean).slice(0, 7); if (words.length) return words.join(" "); } catch { /* Keep a useful local fallback when a provider cannot serve the second request. */ } return fallbackChatTitle(firstMessage); }
 function fallbackChatTitle(firstMessage: string): string { const words = firstMessage.replace(/[^\p{L}\p{N}\s-]/gu, " ").split(/\s+/).filter(Boolean).slice(0, 7); return words.length ? words.join(" ") : "New chat"; }
 function escapeHtml(value: string): string { return value.replace(/[&<>\"]/g, (character) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[character] ?? character); }
 function isSendMessage(value: unknown): value is { type: "chat-send"; content: string } { return typeof value === "object" && value !== null && (value as { type?: unknown }).type === "chat-send" && typeof (value as { content?: unknown }).content === "string"; }
 function isResourceRefresh(value: unknown): value is { type: "resource-refresh" } { return typeof value === "object" && value !== null && (value as { type?: unknown }).type === "resource-refresh"; }
+function isAgentSelect(value: unknown): value is { type: "chat-agent-select"; agentIdentity: string } { return typeof value === "object" && value !== null && (value as { type?: unknown }).type === "chat-agent-select" && typeof (value as { agentIdentity?: unknown }).agentIdentity === "string"; }
 function isChatAction(value: unknown): value is { type: "chat-action"; action: "new" | "toggle-trash" | "select" | "rename" | "fork" | "trash" | "restore" | "delete"; chatId?: string; title?: string } { return typeof value === "object" && value !== null && (value as { type?: unknown }).type === "chat-action" && ["new", "toggle-trash", "select", "rename", "fork", "trash", "restore", "delete"].includes(String((value as { action?: unknown }).action)); }
 
 function navigationButton(id: string, icon: string, label: string, active = false): string {

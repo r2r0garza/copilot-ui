@@ -2,7 +2,7 @@ import type { Diagnostic, ResourceCatalogState, ResourceStatus } from "../featur
 
 export function renderResourceCatalog(state: ResourceCatalogState): string {
   const { catalog } = state;
-  const resources = [...catalog.agents, ...catalog.skills, ...catalog.mcpServers];
+  const resources = [...catalog.agents, ...catalog.skills, ...catalog.mcpServers, ...catalog.tools];
   const counts = {
     available: resources.filter((item) => item.status === "available").length,
     unavailable: resources.filter((item) => item.status === "unavailable").length,
@@ -14,7 +14,7 @@ export function renderResourceCatalog(state: ResourceCatalogState): string {
       <div>
         <p class="eyebrow">Fixed-source registry · revision ${state.revision}</p>
         <h1>Resource Catalog</h1>
-        <p class="lede">Validated Agents, Skills, and MCP servers for <strong>${escapeHtml(state.workspaceName)}</strong>. Active attempts retain the revision they started with.</p>
+        <p class="lede">Validated Agents, Skills, MCP servers, and Tools for <strong>${escapeHtml(state.workspaceName)}</strong>. Active attempts retain the revision they started with.</p>
       </div>
       <button id="resource-refresh" class="quiet-action refresh-action" type="button"><span aria-hidden="true">↻</span> Refresh</button>
     </div>
@@ -46,6 +46,13 @@ export function renderResourceCatalog(state: ResourceCatalogState): string {
           server.reason ?? `${server.transport?.toUpperCase() ?? "Unknown"} transport`,
           server.reason,
           server.requiresOAuth ? "OAuth" : server.inputIds.length ? `${server.inputIds.length} inputs` : "No inputs",
+        )))}
+        ${resourceGroup("Tools", "Bounded Workbench capabilities", catalog.tools.map((tool) => resourceRow(
+          tool.identity,
+          tool.status,
+          `${tool.effectClass} · ${tool.origin}`,
+          tool.reason,
+          tool.effectClass,
         )))}
       </div>
       ${diagnostics(catalog.diagnostics)}

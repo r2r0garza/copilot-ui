@@ -15,6 +15,7 @@ test("renders catalog status, actionable diagnostics, and escaped repository met
       agents: [{ identity: "reviewer", description: "Review code", instructions: "Private instructions", model: null, tools: null, status: "available" }],
       skills: [{ name: "forked", description: "Fork work", userInvocable: true, disableModelInvocation: false, status: "unavailable", reason: "Fork context is unavailable." }],
       mcpServers: [{ name: "broken", fingerprint: "b".repeat(64), status: "invalid", reason: "Missing command.", transport: null, inputIds: [], requiresOAuth: false }],
+      tools: [{ identity: "files/read", origin: "workbench", effectClass: "read", status: "available", inputSchema: {}, inputSchemaFingerprint: "c".repeat(64), resultSchema: {} }],
       diagnostics: [{ resource: "mcp:broken", code: "mcp.server-invalid", severity: "error", message: "Missing <command>." }],
     },
   };
@@ -24,6 +25,8 @@ test("renders catalog status, actionable diagnostics, and escaped repository met
   assert.match(html, /revision 7/);
   assert.match(html, /&lt;unsafe&gt;/);
   assert.match(html, /mcp\.server-invalid/);
+  assert.match(html, />Tools</);
+  assert.match(html, /files\/read/);
   assert.match(html, /Missing &lt;command&gt;\./);
   assert.doesNotMatch(html, /Private instructions/);
   assert.match(html, /resource-refresh/);
@@ -36,7 +39,7 @@ test("renders an explicit no-workspace state", () => {
     revision: 0,
     refreshedAt: "2026-07-26T00:00:00.000Z",
     fingerprint: "0".repeat(64),
-    catalog: { agents: [], skills: [], mcpServers: [], diagnostics: [] },
+    catalog: { agents: [], skills: [], mcpServers: [], tools: [], diagnostics: [] },
   });
   assert.match(html, /Open a repository workspace/);
 });

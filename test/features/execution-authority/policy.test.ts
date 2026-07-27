@@ -4,7 +4,8 @@ import { audit, authorize, operationKey, validateRepositoryPath } from "../../..
 
 test("rejects paths outside the canonical repository boundary", () => {
   assert.equal(validateRepositoryPath("/workspace/repo", "src/index.ts"), "src/index.ts");
-  assert.throws(() => validateRepositoryPath("/workspace/repo", "../secret"), /outside/);
+  assert.throws(() => validateRepositoryPath("/workspace/repo", "../secret"), /parent-traversal/);
+  assert.throws(() => validateRepositoryPath("/workspace/repo", "src/../secret"), /parent-traversal/);
   assert.throws(() => validateRepositoryPath("/workspace/repo", "/etc/passwd"), /repository-relative/);
 });
 

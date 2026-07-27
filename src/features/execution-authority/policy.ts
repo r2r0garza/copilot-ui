@@ -9,6 +9,7 @@ export interface ToolAudit { readonly auditId: string; readonly operationKey: st
 
 export function validateRepositoryPath(repositoryRoot: string, candidate: string): string {
   if (!candidate || candidate.includes("\0") || /^(?:[\\/]|[A-Za-z]:|\\\\|\\\.\\)/.test(candidate)) throw new Error("path-must-be-repository-relative");
+  if (candidate.split(/[\\/]+/).some((segment) => segment === "..")) throw new Error("path-parent-traversal-rejected");
   const root = resolve(repositoryRoot); const target = resolve(root, candidate);
   if (target !== root && !target.startsWith(root + sep)) throw new Error("path-outside-repository-boundary");
   return relative(root, target).split(sep).join("/");
