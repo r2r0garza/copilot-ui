@@ -1,6 +1,6 @@
 import * as vscode from "vscode";
 
-import { WorkspaceStore } from "../adapters/sqlite/workspaceStore";
+import { WorkspaceStore, type ChatRecord, type TurnRecord } from "../adapters/sqlite/workspaceStore";
 import { bundledOrchestrator, listChatAgents, resolveAvailableChatAgent, selectAvailableModel } from "../features/chats";
 import type { EffectiveModelSnapshot, ResourceCatalogState, ResourceSnapshot } from "../features/resources";
 import {
@@ -57,6 +57,7 @@ export function createWorkbenchPanel(
   };
   let selectedChatId: string | undefined;
   let showingTrash = false;
+  const activeCancellations = new Map<string, { readonly attemptId: string; readonly source: vscode.CancellationTokenSource }>();
   let resourceState = _runtime.resources.getState();
   let draftAgentIdentity = bundledOrchestrator.identity;
   const currentState = (): ChatViewState => chatState(getStore(), selectedChatId, showingTrash, resourceState, draftAgentIdentity);
@@ -70,6 +71,7 @@ export function createWorkbenchPanel(
     selectedChatId: undefined,
     showingTrash: false,
     messages: [],
+    ledger: [],
     activeAgentIdentity: bundledOrchestrator.identity,
     agents: listChatAgents(resourceState),
     catalogRevision: resourceState.revision,
@@ -83,6 +85,103 @@ export function createWorkbenchPanel(
     void sendState("chat-resource-state");
   });
   panel.onDidDispose(() => resourceSubscription.dispose());
+
+  const executeResponse = async (targetChat: ChatRecord, turn: TurnRecord): Promise<void> => {
+    const authority = getStore();
+    let activeAttemptId: string | undefined;
+    let cancellation: vscode.CancellationTokenSource | undefined;
+    try {
+      if (!resolveAvailableChatAgent(resourceState, targetChat.agentIdentity)) throw new Error("This Chat’s Agent is no longer available. Select an available Agent to start a new Chat.");
+      const models = await vscode.lm.selectChatModels();
+      const agent = resolveAvailableChatAgent(resourceState, targetChat.agentIdentity);
+      if (!agent) {
+        const failedAttempt = authority.createResponseAttempt(turn.turnId, targetChat.requestedModelId);
+        authority.transitionAttempt(failedAttempt.attemptId, "failed");
+        throw new Error("This Chat’s Agent changed before its Resource Snapshot could be pinned.");
+      }
+      let modelSelection;
+      try {
+        modelSelection = selectAvailableModel(targetChat.requestedModelId, agent.model, models.map((model) => model.id));
+      } catch (error) {
+        const failedAttempt = authority.createResponseAttempt(turn.turnId, targetChat.requestedModelId);
+        authority.transitionAttempt(failedAttempt.attemptId, "blocked");
+        throw error;
+      }
+      const model = models.find((candidate) => candidate.id === modelSelection.effectiveModelId);
+      if (!model) throw new Error("effective-model-disappeared");
+      const attempt = authority.createResponseAttempt(turn.turnId, targetChat.requestedModelId, undefined, model.id);
+      activeAttemptId = attempt.attemptId;
+      const resourceSnapshot = _runtime.resources.createSnapshot(attempt.attemptId, agent, modelSnapshot(model, modelSelection.source));
+      authority.pinResourceSnapshot(attempt.attemptId, resourceSnapshot.snapshotId, JSON.stringify(resourceSnapshot), resourceSnapshot.createdAt);
+      authority.transitionAttempt(attempt.attemptId, "running");
+      cancellation = new vscode.CancellationTokenSource();
+      activeCancellations.set(targetChat.chatId, { attemptId: attempt.attemptId, source: cancellation });
+      await sendState();
+      if (targetChat.title === "New chat" && attempt.ordinal === 1) {
+        authority.setChatTitle(targetChat.chatId, await generateChatTitle(model, turn.content, cancellation.token));
+      }
+      const repositoryRoot = resourceState.workspaceRoot;
+      if (!repositoryRoot) throw new Error("Open a repository folder before using Chat.");
+      const dispatcher = new ChatToolDispatcher({
+        store: authority,
+        repositoryRoot,
+        chatId: targetChat.chatId,
+        attemptId: attempt.attemptId,
+        snapshot: resourceSnapshot,
+        requestApproval: async ({ tool, affectedTargets, riskSummary }) => {
+          if (cancellation?.token.isCancellationRequested) return "deny";
+          authority.transitionAttempt(attempt.attemptId, "waiting-for-approval");
+          await sendState();
+          const detail = [
+            riskSummary,
+            affectedTargets.length ? `Targets: ${affectedTargets.join(", ")}` : "Target: active repository",
+            "The exact Tool, scope, snapshot, decision, and outcome will be recorded locally.",
+          ].join("\n\n");
+          const choice = await vscode.window.showWarningMessage(
+            `${resourceSnapshot.agentIdentity} wants to run ${tool.identity}.`,
+            { modal: true, detail },
+            "Allow once",
+            "Allow for this Chat",
+            "Deny",
+          );
+          if (cancellation?.token.isCancellationRequested) return "deny";
+          authority.transitionAttempt(attempt.attemptId, "running");
+          await sendState();
+          return approvalFromChoice(choice);
+        },
+      });
+      const output = await runChatModelWithTools(
+        model,
+        resourceSnapshot,
+        buildChatContext(authority, targetChat.chatId),
+        dispatcher,
+        cancellation.token,
+        async (visible) => {
+          authority.checkpointOutput(turn.turnId, visible);
+          await panel.webview.postMessage({ type: "chat-stream", html: renderAssistantMarkdown(visible) });
+        },
+      );
+      if (cancellation.token.isCancellationRequested) throw new vscode.CancellationError();
+      authority.appendOutput(turn.turnId, output || "The model returned no visible text.");
+      authority.transitionAttempt(attempt.attemptId, "succeeded");
+      await sendState();
+    } catch (error) {
+      if (activeAttemptId) {
+        try {
+          const requestedCancellation = cancellation?.token.isCancellationRequested === true;
+          authority.transitionAttempt(activeAttemptId, requestedCancellation ? "cancelled" : "failed");
+        } catch { /* Preserve the original classified failure. */ }
+      }
+      await sendState();
+      if (!(error instanceof vscode.CancellationError) && cancellation?.token.isCancellationRequested !== true) {
+        await panel.webview.postMessage({ type: "chat-error", message: error instanceof Error ? error.message : "Unable to send this Chat message." });
+      }
+    } finally {
+      if (activeCancellations.get(targetChat.chatId)?.attemptId === activeAttemptId) activeCancellations.delete(targetChat.chatId);
+      cancellation?.dispose();
+    }
+  };
+
   panel.webview.onDidReceiveMessage(async (message: unknown) => {
     if (isResourceRefresh(message)) {
       const state = _runtime.resources.refresh();
@@ -122,8 +221,50 @@ export function createWorkbenchPanel(
           if (chat) { selectedChatId = chat.chatId; draftAgentIdentity = chat.agentIdentity; }
         }
         else if (!selected) throw new Error("select-or-create-a-chat-first");
+        else if (message.action === "cancel-attempt") {
+          const active = activeCancellations.get(selected);
+          if (!active) throw new Error("chat-has-no-active-response");
+          active.source.cancel();
+          return;
+        }
+        else if (message.action === "retry-attempt") {
+          const prior = message.attemptId ? authority.getResponseAttempt(message.attemptId) : undefined;
+          const chat = authority.getChat(selected);
+          const turn = prior ? authority.listTurns(selected).find((candidate) => candidate.turnId === prior.turnId) : undefined;
+          if (!prior || !chat || !turn || !["blocked", "failed", "cancelled", "interrupted"].includes(prior.state)) throw new Error("response-attempt-not-retryable");
+          if (authority.attemptHasUnsettledOperation(prior.attemptId)) throw new Error("Reconcile the prior Tool outcome before retrying this response.");
+          await executeResponse(chat, turn);
+          return;
+        }
+        else if (message.action === "generate-summary") {
+          const chat = authority.getChat(selected);
+          const agent = chat ? resolveAvailableChatAgent(resourceState, chat.agentIdentity) : undefined;
+          if (!chat || !agent) throw new Error("chat-agent-unavailable");
+          if (activeCancellations.has(chat.chatId)) throw new Error("Wait for the active response before generating a summary.");
+          const models = await vscode.lm.selectChatModels();
+          const selection = selectAvailableModel(chat.requestedModelId, agent.model, models.map((model) => model.id));
+          const model = models.find((candidate) => candidate.id === selection.effectiveModelId);
+          if (!model) throw new Error("effective-model-disappeared");
+          const turns = authority.listTurns(chat.chatId);
+          if (turns.length === 0) throw new Error("chat-has-no-history");
+          const summaryCancellation = new vscode.CancellationTokenSource();
+          try {
+            const summary = await generateConversationSummary(model, buildChatContext(authority, chat.chatId), summaryCancellation.token);
+            authority.createSummary(chat.chatId, summary, `explicit:model:${model.id}:through-turn:${turns.at(-1)?.turnId}`);
+          } finally {
+            summaryCancellation.dispose();
+          }
+        }
+        else if (message.action === "add-ledger") {
+          if (!message.content?.trim()) throw new Error("ledger-content-empty");
+          authority.appendLedger(selected, message.kind?.trim() || "note", message.content, "explicit-user-entry");
+        }
+        else if (message.action === "correct-ledger") {
+          if (!message.entryId || !message.content?.trim()) throw new Error("ledger-correction-invalid");
+          authority.correctLedger(message.entryId, message.content, `user-correction:${message.rationale?.trim() || "corrected in Workbench"}`);
+        }
         else if (message.action === "fork") { selectedChatId = authority.forkChat(selected, authority.getChat(selected)?.agentIdentity ?? "bundled:orchestrator").chatId; showingTrash = false; }
-        else if (message.action === "trash") { authority.trashChat(selected); selectedChatId = authority.listChats()[0]?.chatId; showingTrash = false; }
+        else if (message.action === "trash") { activeCancellations.get(selected)?.source.cancel(); authority.trashChat(selected); selectedChatId = authority.listChats()[0]?.chatId; showingTrash = false; }
         else if (message.action === "restore") { authority.restoreChat(selected); showingTrash = false; }
         else if (message.action === "rename") { if (!message.title?.trim()) throw new Error("chat-title-empty"); authority.setChatTitle(selected, message.title); }
         else if (message.action === "delete") { authority.deleteChatPermanently(selected, true); selectedChatId = authority.listChats(true)[0]?.chatId; }
@@ -134,7 +275,6 @@ export function createWorkbenchPanel(
     if (!isSendMessage(message)) return;
     const content = message.content.trim();
     if (!content) return;
-    let activeAttemptId: string | undefined;
     try {
       const authority = getStore();
       const chat = selectedChatId ? authority.getChat(selectedChatId) : undefined;
@@ -143,77 +283,8 @@ export function createWorkbenchPanel(
       if (!resolveAvailableChatAgent(resourceState, targetChat.agentIdentity)) throw new Error("This Chat’s Agent is no longer available. Select an available Agent to start a new Chat.");
       const turn = authority.submitTurn(targetChat.chatId, content);
       await panel.webview.postMessage({ type: "chat-user-markdown", html: renderAssistantMarkdown(content) });
-      const models = await vscode.lm.selectChatModels();
-      const agent = resolveAvailableChatAgent(resourceState, targetChat.agentIdentity);
-      if (!agent) {
-        const failedAttempt = authority.createResponseAttempt(turn.turnId, targetChat.requestedModelId);
-        authority.transitionAttempt(failedAttempt.attemptId, "failed");
-        throw new Error("This Chat’s Agent changed before its Resource Snapshot could be pinned.");
-      }
-      let modelSelection;
-      try {
-        modelSelection = selectAvailableModel(targetChat.requestedModelId, agent.model, models.map((model) => model.id));
-      } catch (error) {
-        const failedAttempt = authority.createResponseAttempt(turn.turnId, targetChat.requestedModelId);
-        authority.transitionAttempt(failedAttempt.attemptId, "failed");
-        throw error;
-      }
-      const model = models.find((candidate) => candidate.id === modelSelection.effectiveModelId);
-      if (!model) throw new Error("effective-model-disappeared");
-      const attempt = authority.createResponseAttempt(turn.turnId, targetChat.requestedModelId, undefined, model.id);
-      activeAttemptId = attempt.attemptId;
-      const resourceSnapshot = _runtime.resources.createSnapshot(attempt.attemptId, agent, modelSnapshot(model, modelSelection.source));
-      authority.pinResourceSnapshot(attempt.attemptId, resourceSnapshot.snapshotId, JSON.stringify(resourceSnapshot), resourceSnapshot.createdAt);
-      authority.transitionAttempt(attempt.attemptId, "running");
-      const cancellation = new vscode.CancellationTokenSource();
-      if (targetChat.title === "New chat") {
-        authority.setChatTitle(targetChat.chatId, await generateChatTitle(model, content, cancellation.token));
-      }
-      const repositoryRoot = resourceState.workspaceRoot;
-      if (!repositoryRoot) throw new Error("Open a repository folder before using Chat.");
-      const dispatcher = new ChatToolDispatcher({
-        store: authority,
-        repositoryRoot,
-        chatId: targetChat.chatId,
-        attemptId: attempt.attemptId,
-        snapshot: resourceSnapshot,
-        requestApproval: async ({ tool, affectedTargets, riskSummary }) => {
-          authority.transitionAttempt(attempt.attemptId, "waiting-for-approval");
-          await sendState();
-          const detail = [
-            riskSummary,
-            affectedTargets.length ? `Targets: ${affectedTargets.join(", ")}` : "Target: active repository",
-            "The exact Tool, scope, snapshot, decision, and outcome will be recorded locally.",
-          ].join("\n\n");
-          const choice = await vscode.window.showWarningMessage(
-            `${resourceSnapshot.agentIdentity} wants to run ${tool.identity}.`,
-            { modal: true, detail },
-            "Allow once",
-            "Allow for this Chat",
-            "Deny",
-          );
-          authority.transitionAttempt(attempt.attemptId, "running");
-          await sendState();
-          return approvalFromChoice(choice);
-        },
-      });
-      const output = await runChatModelWithTools(
-        model,
-        resourceSnapshot,
-        content,
-        dispatcher,
-        cancellation.token,
-        async (visible) => {
-          authority.checkpointOutput(turn.turnId, visible);
-          await panel.webview.postMessage({ type: "chat-stream", html: renderAssistantMarkdown(visible) });
-        },
-      );
-      authority.appendOutput(turn.turnId, output || "The model returned no visible text.");
-      authority.transitionAttempt(attempt.attemptId, "succeeded");
-      await sendState();
+      await executeResponse(targetChat, turn);
     } catch (error) {
-      // Submitted turns and any streamed checkpoint stay durable; no attempt is silently retried.
-      if (activeAttemptId) { try { getStore().transitionAttempt(activeAttemptId, "failed"); } catch { /* Preserve the original classified failure. */ } }
       await panel.webview.postMessage({ type: "chat-error", message: error instanceof Error ? error.message : "Unable to send this Chat message." });
     }
   });
@@ -298,7 +369,7 @@ function renderWorkbench(webview: vscode.Webview, state: ChatViewState, resource
       .session-empty { display: grid; place-items: center; gap: 8px; padding: 38px 10px; color: var(--vscode-descriptionForeground); text-align: center; }
       .session-empty > span { font-size: 20px; }
       .session-empty p { margin: 0; font-size: 11px; }
-      .conversation-panel { min-width: 0; min-height: 0; display: grid; grid-template-rows: auto minmax(0, 1fr) auto auto; }
+      .conversation-panel { min-width: 0; min-height: 0; display: grid; grid-template-rows: auto minmax(0, 1fr) auto auto auto; }
       .conversation-header { padding-inline: 16px; }
       .conversation-identity { min-width: 0; display: flex; align-items: center; gap: 10px; }
       .conversation-identity > div { min-width: 0; display: grid; gap: 3px; }
@@ -310,7 +381,8 @@ function renderWorkbench(webview: vscode.Webview, state: ChatViewState, resource
       .toolbar-input { min-width: 190px; padding: 7px 9px; color: var(--vscode-input-foreground); border: 1px solid var(--vscode-focusBorder); border-radius: 3px; background: var(--vscode-input-background); font: inherit; }
       .transcript { min-height: 0; display: flex; flex-direction: column; align-items: flex-start; gap: 15px; padding: 22px; overflow-y: auto; background-image: linear-gradient(color-mix(in srgb, var(--vscode-panel-border) 25%, transparent) 1px, transparent 1px); background-size: 100% 42px; }
       .message { width: fit-content; max-width: min(82%, 680px); flex: 0 0 auto; border: 1px solid var(--vscode-panel-border); border-left: 2px solid var(--vscode-testing-iconPassed); background: color-mix(in srgb, var(--vscode-textBlockQuote-background) 82%, var(--vscode-editor-background)); overflow-wrap: anywhere; }
-      .message header { padding: 6px 11px; border-bottom: 1px solid var(--vscode-panel-border); color: var(--vscode-descriptionForeground); font: 9px var(--vscode-editor-font-family); letter-spacing: .08em; }
+      .message header { display: flex; justify-content: space-between; gap: 12px; padding: 6px 11px; border-bottom: 1px solid var(--vscode-panel-border); color: var(--vscode-descriptionForeground); font: 9px var(--vscode-editor-font-family); letter-spacing: .08em; }
+      .attempt-state { color: var(--vscode-errorForeground); text-transform: uppercase; }
       .message > div { padding: 9px 11px 10px; white-space: pre-wrap; line-height: 1.5; }
       .message.user { align-self: flex-end; border-left: 1px solid var(--vscode-panel-border); border-right: 2px solid var(--vscode-focusBorder); background: var(--vscode-input-background); }
       .message.assistant { align-self: flex-start; }
@@ -329,6 +401,24 @@ function renderWorkbench(webview: vscode.Webview, state: ChatViewState, resource
       .empty-glyph { display: block; margin-bottom: 13px; color: var(--vscode-focusBorder); font-size: 29px; }
       .transcript-empty h2 { margin: 0 0 8px; font-size: 16px; font-weight: 600; }
       .transcript-empty p { margin: 0; color: var(--vscode-descriptionForeground); font-size: 11px; line-height: 1.55; }
+      .session-context { border-top: 1px solid var(--vscode-panel-border); background: var(--vscode-sideBar-background); }
+      .session-context > summary { display: flex; justify-content: space-between; gap: 12px; padding: 8px 14px; color: var(--vscode-descriptionForeground); cursor: pointer; font-size: 10px; }
+      .session-context-grid { max-height: 220px; display: grid; grid-template-columns: 1fr 1fr; overflow-y: auto; border-top: 1px solid var(--vscode-panel-border); }
+      .session-context-grid > section { min-width: 0; padding: 12px 14px; }
+      .session-context-grid > section + section { border-left: 1px solid var(--vscode-panel-border); }
+      .context-section-heading, .context-record header { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; }
+      .context-section-heading { margin-bottom: 9px; }
+      .context-section-heading h3 { margin: 0; font-size: 12px; }
+      .context-section-heading .eyebrow { margin-bottom: 2px; font-size: 8px; }
+      .context-record { margin-top: 7px; padding: 9px; border: 1px solid var(--vscode-panel-border); background: var(--vscode-editor-background); }
+      .context-record strong { font-size: 10px; text-transform: capitalize; }
+      .context-record small { overflow: hidden; color: var(--vscode-descriptionForeground); font: 8px var(--vscode-editor-font-family); text-overflow: ellipsis; white-space: nowrap; }
+      .context-record p, .context-empty { margin: 7px 0 0; color: var(--vscode-descriptionForeground); font-size: 10px; line-height: 1.45; white-space: pre-wrap; }
+      .text-action { margin-top: 5px; padding: 0; border: 0; color: var(--vscode-textLink-foreground); background: transparent; cursor: pointer; font-size: 9px; }
+      .ledger-editor { display: grid; gap: 7px; margin: 7px 0 10px; padding: 9px; border: 1px solid var(--vscode-focusBorder); background: var(--vscode-editor-background); }
+      .ledger-editor input, .ledger-editor textarea { width: 100%; min-height: 32px; padding: 7px 8px; color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border); background: var(--vscode-input-background); font: inherit; }
+      .ledger-editor textarea { min-height: 64px; resize: vertical; }
+      .ledger-editor-actions { display: flex; justify-content: flex-end; gap: 7px; }
       .composer { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 10px; padding: 12px 14px 14px; border-top: 1px solid var(--vscode-panel-border); background: var(--vscode-sideBar-background); }
       .composer-field { min-width: 0; display: grid; gap: 5px; }
       .composer-hint { color: var(--vscode-descriptionForeground); font-size: 9px; }
@@ -393,7 +483,7 @@ function renderWorkbench(webview: vscode.Webview, state: ChatViewState, resource
       .diagnostic strong { overflow: hidden; text-overflow: ellipsis; text-align: right; white-space: nowrap; }
       .diagnostic p { grid-column: 1 / -1; margin: 1px 0 0; color: var(--vscode-descriptionForeground); font-size: 11px; line-height: 1.45; }
       @media (max-width: 980px) { .resource-grid { grid-template-columns: 1fr; } .resource-list { min-height: auto; } .chat-context-strip { grid-template-columns: 1fr 1fr; } .agent-picker { grid-column: 1 / -1; border-right: 0; border-bottom: 1px solid var(--vscode-panel-border); } }
-      @media (max-width: 760px) { .workbench { grid-template-columns: 58px minmax(0, 1fr); } .brand span, .nav-label, .rail-footer { display: none; } .brand { justify-content: center; margin-inline: 0; } .nav-button { justify-content: center; padding-inline: 4px; } .board { grid-template-columns: 1fr; } .card--wide { grid-column: auto; } .content { padding: 24px 18px; } .chat-masthead, .resource-masthead { display: block; } .chat-actions { justify-content: flex-start; margin: 0 0 16px; } .refresh-action { margin: 0 0 16px; } .chat-shell { height: auto; grid-template-columns: 1fr; } .session-panel { max-height: 190px; border-right: 0; border-bottom: 1px solid var(--vscode-panel-border); } .conversation-panel { min-height: 440px; } .catalog-strip { grid-template-columns: repeat(3, 1fr); } .catalog-revision { grid-column: 1 / -1; border-top: 1px solid var(--vscode-panel-border); } .diagnostic-list { grid-template-columns: 1fr; } .diagnostic { border-right: 0; } }
+      @media (max-width: 760px) { .workbench { grid-template-columns: 58px minmax(0, 1fr); } .brand span, .nav-label, .rail-footer { display: none; } .brand { justify-content: center; margin-inline: 0; } .nav-button { justify-content: center; padding-inline: 4px; } .board { grid-template-columns: 1fr; } .card--wide { grid-column: auto; } .content { padding: 24px 18px; } .chat-masthead, .resource-masthead { display: block; } .chat-actions { justify-content: flex-start; margin: 0 0 16px; } .refresh-action { margin: 0 0 16px; } .chat-shell { height: auto; grid-template-columns: 1fr; } .session-panel { max-height: 190px; border-right: 0; border-bottom: 1px solid var(--vscode-panel-border); } .conversation-panel { min-height: 440px; } .session-context-grid { grid-template-columns: 1fr; } .session-context-grid > section + section { border-left: 0; border-top: 1px solid var(--vscode-panel-border); } .catalog-strip { grid-template-columns: repeat(3, 1fr); } .catalog-revision { grid-column: 1 / -1; border-top: 1px solid var(--vscode-panel-border); } .diagnostic-list { grid-template-columns: 1fr; } .diagnostic { border-right: 0; } }
       @media (max-width: 480px) { .chat-context-strip { grid-template-columns: 1fr; } .agent-picker, .context-cell { grid-column: auto; border-right: 0; border-bottom: 1px solid var(--vscode-panel-border); } .context-cell:last-child { border-bottom: 0; } .conversation-header { align-items: flex-start; } .chat-toolbar { justify-content: flex-start; } .message { max-width: 94%; } .composer { grid-template-columns: 1fr; } .composer-send { justify-content: center; } }
     </style>
   </head>
@@ -428,7 +518,7 @@ function renderWorkbench(webview: vscode.Webview, state: ChatViewState, resource
         for (const view of document.querySelectorAll('.view')) view.dataset.active = String(view.id === target);
         if (target === 'chats') requestAnimationFrame(scrollToLatest);
       });
-      const vscode = acquireVsCodeApi(); const transcript = () => document.querySelector('#transcript'); const chatError = () => document.querySelector('#chat-error'); const scrollToLatest = () => { const element = transcript(); if (element) element.scrollTop = element.scrollHeight; }; const escapeHtml = (value) => value.replace(/[&<>]/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+      const vscode = acquireVsCodeApi(); const transcript = () => document.querySelector('#transcript'); const chatError = () => document.querySelector('#chat-error'); const scrollToLatest = () => { const element = transcript(); if (element) element.scrollTop = element.scrollHeight; }; const escapeHtml = (value) => value.replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
       const resizeComposer = (input) => { input.style.height = 'auto'; input.style.height = Math.min(input.scrollHeight, 180) + 'px'; input.style.overflowY = input.scrollHeight > 180 ? 'auto' : 'hidden'; };
       document.addEventListener('input', (event) => { if (event.target instanceof HTMLTextAreaElement && event.target.id === 'chat-input') resizeComposer(event.target); });
       document.addEventListener('keydown', (event) => { if (event.key === 'Enter' && !event.shiftKey && event.target instanceof HTMLTextAreaElement && event.target.id === 'chat-input') { event.preventDefault(); event.target.form?.requestSubmit(); } });
@@ -436,11 +526,11 @@ function renderWorkbench(webview: vscode.Webview, state: ChatViewState, resource
       document.addEventListener('change', (event) => { if (event.target instanceof HTMLSelectElement && event.target.id === 'chat-agent-select') vscode.postMessage({ type: 'chat-agent-select', agentIdentity: event.target.value }); });
       const saveRename = () => { const title = document.querySelector('#rename-input')?.value || ''; vscode.postMessage({ type: 'chat-action', action: 'rename', title }); };
       document.addEventListener('click', (event) => { if (event.target instanceof Element && event.target.closest('#resource-refresh')) vscode.postMessage({ type: 'resource-refresh' }); });
-      document.addEventListener('click', (event) => { if (!(event.target instanceof Element)) return; const control = event.target.closest('[data-chat-action]'); if (!control) return; const action = control.dataset.chatAction; const toolbar = document.querySelector('#chat-toolbar'); const selectedTitle = document.querySelector('.session-item[aria-current="true"] span')?.textContent || ''; if (action === 'rename') { if (toolbar) { toolbar.innerHTML = '<input id="rename-input" class="toolbar-input" aria-label="Chat title" value="' + escapeHtml(selectedTitle) + '"><button data-chat-action="rename-save" class="send" type="button">Save</button><button data-chat-action="rename-cancel" class="quiet-action" type="button">Cancel</button>'; const input = document.querySelector('#rename-input'); input?.focus(); input?.select(); } return; } if (action === 'rename-cancel') { vscode.postMessage({ type: 'chat-action', action: 'select' }); return; } if (action === 'rename-save') { saveRename(); return; } if (action === 'delete') { if (toolbar) toolbar.innerHTML = '<span class="muted">Delete this Chat permanently?</span><button data-chat-action="delete-confirm" class="danger-action" type="button">Confirm delete</button><button data-chat-action="delete-cancel" class="quiet-action" type="button">Cancel</button>'; return; } if (action === 'delete-cancel') { vscode.postMessage({ type: 'chat-action', action: 'select' }); return; } if (action === 'delete-confirm') { vscode.postMessage({ type: 'chat-action', action: 'delete' }); return; } vscode.postMessage({ type: 'chat-action', action, chatId: control.dataset.chatId }); });
+      document.addEventListener('click', (event) => { if (!(event.target instanceof Element)) return; const control = event.target.closest('[data-chat-action]'); if (!control) return; const action = control.dataset.chatAction; const toolbar = document.querySelector('#chat-toolbar'); const selectedTitle = document.querySelector('.session-item[aria-current="true"] span')?.textContent || ''; if (action === 'rename') { if (toolbar) { toolbar.innerHTML = '<input id="rename-input" class="toolbar-input" aria-label="Chat title" value="' + escapeHtml(selectedTitle) + '"><button data-chat-action="rename-save" class="send" type="button">Save</button><button data-chat-action="rename-cancel" class="quiet-action" type="button">Cancel</button>'; const input = document.querySelector('#rename-input'); input?.focus(); input?.select(); } return; } if (action === 'rename-cancel') { vscode.postMessage({ type: 'chat-action', action: 'select' }); return; } if (action === 'rename-save') { saveRename(); return; } if (action === 'add-ledger-open' || action === 'correct-ledger-open') { const slot = document.querySelector('#ledger-editor-slot'); if (!slot) return; const correcting = action === 'correct-ledger-open'; const content = correcting ? control.dataset.entryContent || '' : ''; slot.innerHTML = '<div class="ledger-editor" data-mode="' + (correcting ? 'correct' : 'add') + '" data-entry-id="' + escapeHtml(control.dataset.entryId || '') + '"><label class="context-label" for="ledger-content">' + (correcting ? 'Corrected entry' : 'Ledger note') + '</label><textarea id="ledger-content" aria-label="' + (correcting ? 'Corrected Ledger entry' : 'New Ledger note') + '">' + escapeHtml(content) + '</textarea>' + (correcting ? '<label class="context-label" for="ledger-rationale">Correction rationale</label><input id="ledger-rationale" aria-label="Correction rationale" value="User correction in Workbench">' : '') + '<div class="ledger-editor-actions"><button data-chat-action="ledger-editor-cancel" class="quiet-action" type="button">Cancel</button><button data-chat-action="ledger-editor-save" class="send" type="button">Save</button></div></div>'; const input = document.querySelector('#ledger-content'); input?.focus(); if (correcting && input instanceof HTMLTextAreaElement) input.select(); return; } if (action === 'ledger-editor-cancel') { const slot = document.querySelector('#ledger-editor-slot'); if (slot) slot.innerHTML = ''; return; } if (action === 'ledger-editor-save') { const editor = control.closest('.ledger-editor'); const content = editor?.querySelector('#ledger-content')?.value || ''; if (!content.trim()) { const error = chatError(); if (error) error.textContent = 'Ledger content cannot be empty.'; return; } if (editor?.dataset.mode === 'correct') { const rationale = editor.querySelector('#ledger-rationale')?.value || 'User correction in Workbench'; vscode.postMessage({ type: 'chat-action', action: 'correct-ledger', entryId: editor.dataset.entryId, content, rationale }); } else { vscode.postMessage({ type: 'chat-action', action: 'add-ledger', kind: 'note', content }); } control.setAttribute('disabled', ''); control.textContent = 'Saving…'; return; } if (action === 'delete') { if (toolbar) toolbar.innerHTML = '<span class="muted">Permanently delete this private Chat? Repository changes, promoted Memory, and surviving forks remain.</span><button data-chat-action="delete-confirm" class="danger-action" type="button">Confirm delete</button><button data-chat-action="delete-cancel" class="quiet-action" type="button">Cancel</button>'; return; } if (action === 'delete-cancel') { vscode.postMessage({ type: 'chat-action', action: 'select' }); return; } if (action === 'delete-confirm') { vscode.postMessage({ type: 'chat-action', action: 'delete' }); return; } vscode.postMessage({ type: 'chat-action', action, chatId: control.dataset.chatId, attemptId: control.dataset.attemptId }); });
       document.addEventListener('keydown', (event) => { if (event.key === 'Enter' && event.target instanceof HTMLInputElement && event.target.id === 'rename-input') { event.preventDefault(); saveRename(); } });
       const replaceView = (id, html) => { const current = document.querySelector('#' + id); if (!current) return; const active = current.dataset.active; const template = document.createElement('template'); template.innerHTML = html; const next = template.content.firstElementChild; if (next) { next.dataset.active = active; current.replaceWith(next); } };
       const refreshChatResources = (html) => { const prior = document.querySelector('#chat-input'); const draft = prior instanceof HTMLTextAreaElement ? prior.value : ''; const focused = prior === document.activeElement; replaceView('chats', html); const next = document.querySelector('#chat-input'); if (next instanceof HTMLTextAreaElement && !next.disabled) { next.value = draft; resizeComposer(next); if (focused) next.focus(); } };
-      window.addEventListener('message', (event) => { const message = event.data; if (message.type === 'chat-state') { replaceView('chats', message.html); scrollToLatest(); } if (message.type === 'chat-resource-state') refreshChatResources(message.html); if (message.type === 'chat-user-markdown') { const pending = document.querySelector('#pending-user-message > div'); if (pending) { pending.innerHTML = message.html; pending.parentElement?.removeAttribute('id'); scrollToLatest(); } } if (message.type === 'chat-stream') { const stream = document.querySelector('#streaming-response > div'); if (stream) { stream.innerHTML = message.html; scrollToLatest(); } } if (message.type === 'chat-error') { const error = chatError(); if (error) error.textContent = message.message; } if (message.type === 'resource-state') replaceView('agents', message.html); });
+      window.addEventListener('message', (event) => { const message = event.data; if (message.type === 'chat-state') { replaceView('chats', message.html); scrollToLatest(); } if (message.type === 'chat-resource-state') refreshChatResources(message.html); if (message.type === 'chat-user-markdown') { const pending = document.querySelector('#pending-user-message > div'); if (pending) { pending.innerHTML = message.html; pending.parentElement?.removeAttribute('id'); scrollToLatest(); } } if (message.type === 'chat-stream') { let stream = document.querySelector('#streaming-response > div'); const element = transcript(); if (!stream && element) { const agent = document.querySelector('.conversation-identity strong')?.textContent || 'Agent'; element.innerHTML += '<article id="streaming-response" class="message markdown assistant"><header><span>' + escapeHtml(agent) + '</span></header><div></div></article>'; stream = document.querySelector('#streaming-response > div'); } if (stream) { stream.innerHTML = message.html; scrollToLatest(); } } if (message.type === 'chat-error') { const error = chatError(); if (error) error.textContent = message.message; } if (message.type === 'resource-state') replaceView('agents', message.html); });
     </script>
   </body>
 </html>`;
@@ -459,10 +549,18 @@ function chatState(
   const activeAgentIdentity = chat?.agentIdentity
     ?? resolveAvailableChatAgent(resources, draftAgentIdentity)?.identity
     ?? bundledOrchestrator.identity;
+  const attempts = chat ? store.listResponseAttempts(chat.chatId) : [];
+  const latestAttemptForTurn = new Map<string, typeof attempts[number]>();
+  for (const attempt of attempts) latestAttemptForTurn.set(attempt.turnId, attempt);
   const messages = chat ? [
     ...store.listTurns(chat.chatId).map((turn) => ({ role: "user" as const, content: turn.content, createdAt: turn.submittedAt })),
-    ...store.listOutputs(chat.chatId).map((output) => ({ role: "assistant" as const, content: output.content, createdAt: output.createdAt })),
+    ...store.listOutputs(chat.chatId).map((output) => ({ role: "assistant" as const, content: output.content, createdAt: output.createdAt, attemptState: latestAttemptForTurn.get(output.turnId)?.state })),
   ].sort((left, right) => left.createdAt.localeCompare(right.createdAt)) : [];
+  const activeAttempt = [...attempts].reverse().find((attempt) => ["preparing", "running", "waiting-for-approval"].includes(attempt.state));
+  const latestAttempt = attempts.at(-1);
+  const retryAttemptId = !activeAttempt && latestAttempt && ["blocked", "failed", "cancelled", "interrupted"].includes(latestAttempt.state) ? latestAttempt.attemptId : undefined;
+  const summaries = chat ? store.listSummaries(chat.chatId) : [];
+  const activeSummary = summaries.find((summary) => summary.active);
   return {
     chats: chats.map((item) => ({
       chatId: item.chatId,
@@ -470,10 +568,16 @@ function chatState(
       agentIdentity: item.agentIdentity,
       trashed: Boolean(item.trashedAt),
       forked: Boolean(item.originChatId),
+      forkOriginDeleted: item.forkOriginDeleted,
     })),
     selectedChatId,
     showingTrash,
-    messages: messages.map(({ role, content }) => ({ role, content })),
+    messages: messages.map(({ role, content, ...message }) => ({ role, content, ...message })),
+    activeAttemptId: activeAttempt?.attemptId,
+    retryAttemptId,
+    summary: activeSummary ? { content: activeSummary.content, provenance: activeSummary.provenance, version: summaries.findIndex((summary) => summary.summaryId === activeSummary.summaryId) + 1 } : undefined,
+    ledger: chat ? store.listLedger(chat.chatId).map(({ entryId, kind, content, provenance, status }) => ({ entryId, kind, content, provenance, status })) : [],
+    repositoryWriteLockHolder: store.repositoryWriteLockHolder(),
     activeAgentIdentity,
     agents: listChatAgents(resources),
     catalogRevision: resources.revision,
@@ -484,14 +588,16 @@ function chatState(
 async function runChatModelWithTools(
   model: vscode.LanguageModelChat,
   snapshot: ResourceSnapshot,
-  userContent: string,
+  context: readonly ChatContextMessage[],
   dispatcher: ChatToolDispatcher,
   token: vscode.CancellationToken,
   checkpoint: (visible: string) => Promise<void>,
 ): Promise<string> {
   const messages: vscode.LanguageModelChatMessage[] = [
     vscode.LanguageModelChatMessage.User(`Follow these repository Agent instructions for this response:\n\n${snapshot.agent.instructions}`),
-    vscode.LanguageModelChatMessage.User(userContent),
+    ...context.map((message) => message.role === "user"
+      ? vscode.LanguageModelChatMessage.User(message.content)
+      : vscode.LanguageModelChatMessage.Assistant(message.content)),
   ];
   const tools = chatModelTools(snapshot).map((tool): vscode.LanguageModelChatTool => ({
     name: chatModelToolName(tool.identity),
@@ -529,8 +635,8 @@ async function runChatModelWithTools(
       const result = invocationCount <= maxInvocations
         ? identity
           ? await dispatcher.invoke(call.callId, identity, call.input)
-          : { ok: false, error: { code: "tool-not-in-pinned-workbench-snapshot" } }
-        : { ok: false, error: { code: "tool-call-budget-exhausted" } };
+          : dispatcher.reject(call.callId, call.name, call.input, "tool-not-in-pinned-workbench-snapshot")
+        : dispatcher.reject(call.callId, call.name, call.input, "tool-call-budget-exhausted");
       results.push(new vscode.LanguageModelToolResultPart(call.callId, [
         new vscode.LanguageModelTextPart(JSON.stringify(result)),
       ]));
@@ -548,6 +654,28 @@ async function runChatModelWithTools(
   visible += notice;
   await checkpoint(visible);
   return visible;
+}
+
+interface ChatContextMessage {
+  readonly role: "user" | "assistant";
+  readonly content: string;
+}
+
+function buildChatContext(store: WorkspaceStore, chatId: string): readonly ChatContextMessage[] {
+  const summary = store.getActiveSummary(chatId);
+  const ledger = store.listLedger(chatId).filter((entry) => entry.status === "active");
+  const prefix: ChatContextMessage[] = [];
+  if (summary) prefix.push({ role: "user", content: `Active Conversation Summary (${summary.provenance}):\n${summary.content}` });
+  if (ledger.length) prefix.push({
+    role: "user",
+    content: `Active Session Ledger:\n${ledger.map((entry) => `- [${entry.kind}] ${entry.content} (provenance: ${entry.provenance})`).join("\n")}`,
+  });
+  const history = [
+    ...store.listTurns(chatId).map((turn) => ({ role: "user" as const, content: turn.content, createdAt: turn.submittedAt })),
+    ...store.listFinalOutputs(chatId).map((output) => ({ role: "assistant" as const, content: output.content, createdAt: output.createdAt })),
+  ].sort((left, right) => left.createdAt.localeCompare(right.createdAt))
+    .map(({ role, content }) => ({ role, content }));
+  return [...prefix, ...history];
 }
 
 function approvalFromChoice(choice: string | undefined): ChatToolApproval {
@@ -582,12 +710,31 @@ async function generateChatTitle(model: vscode.LanguageModelChat, firstMessage: 
   } catch { /* Keep a useful local fallback if the snapshotted model cannot title this Chat. */ }
   return fallbackChatTitle(firstMessage);
 }
+async function generateConversationSummary(model: vscode.LanguageModelChat, context: readonly ChatContextMessage[], token: vscode.CancellationToken): Promise<string> {
+  const transcript = context.map((message) => `${message.role === "user" ? "User" : "Assistant"}: ${message.content}`).join("\n\n");
+  const prompt = `Create a concise factual Conversation Summary for the transcript below. Preserve decisions, constraints, unresolved questions, and important repository observations. Do not invent facts. Return only the summary.\n\n${transcript}`;
+  const response = await model.sendRequest([vscode.LanguageModelChatMessage.User(prompt)], {}, token);
+  let summary = "";
+  for await (const fragment of response.text) summary += fragment;
+  if (!summary.trim()) throw new Error("summary-model-returned-empty-output");
+  return summary.trim();
+}
 function fallbackChatTitle(firstMessage: string): string { const words = firstMessage.replace(/[^\p{L}\p{N}\s-]/gu, " ").split(/\s+/).filter(Boolean).slice(0, 7); return words.length ? words.join(" ") : "New chat"; }
 function escapeHtml(value: string): string { return value.replace(/[&<>\"]/g, (character) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[character] ?? character); }
 function isSendMessage(value: unknown): value is { type: "chat-send"; content: string } { return typeof value === "object" && value !== null && (value as { type?: unknown }).type === "chat-send" && typeof (value as { content?: unknown }).content === "string"; }
 function isResourceRefresh(value: unknown): value is { type: "resource-refresh" } { return typeof value === "object" && value !== null && (value as { type?: unknown }).type === "resource-refresh"; }
 function isAgentSelect(value: unknown): value is { type: "chat-agent-select"; agentIdentity: string } { return typeof value === "object" && value !== null && (value as { type?: unknown }).type === "chat-agent-select" && typeof (value as { agentIdentity?: unknown }).agentIdentity === "string"; }
-function isChatAction(value: unknown): value is { type: "chat-action"; action: "new" | "toggle-trash" | "select" | "rename" | "fork" | "trash" | "restore" | "delete"; chatId?: string; title?: string } { return typeof value === "object" && value !== null && (value as { type?: unknown }).type === "chat-action" && ["new", "toggle-trash", "select", "rename", "fork", "trash", "restore", "delete"].includes(String((value as { action?: unknown }).action)); }
+function isChatAction(value: unknown): value is {
+  type: "chat-action";
+  action: "new" | "toggle-trash" | "select" | "rename" | "fork" | "trash" | "restore" | "delete" | "cancel-attempt" | "retry-attempt" | "generate-summary" | "add-ledger" | "correct-ledger";
+  chatId?: string;
+  title?: string;
+  attemptId?: string;
+  entryId?: string;
+  kind?: string;
+  content?: string;
+  rationale?: string;
+} { return typeof value === "object" && value !== null && (value as { type?: unknown }).type === "chat-action" && ["new", "toggle-trash", "select", "rename", "fork", "trash", "restore", "delete", "cancel-attempt", "retry-attempt", "generate-summary", "add-ledger", "correct-ledger"].includes(String((value as { action?: unknown }).action)); }
 
 function navigationButton(id: string, icon: string, label: string, active = false): string {
   return `<button class="nav-button" role="tab" aria-selected="${active}" data-target="${id}"><span class="nav-icon" aria-hidden="true">${icon}</span><span class="nav-label">${label}</span></button>`;

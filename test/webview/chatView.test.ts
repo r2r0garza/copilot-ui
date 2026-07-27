@@ -20,6 +20,7 @@ function state(overrides: Partial<ChatViewState> = {}): ChatViewState {
     selectedChatId: undefined,
     showingTrash: false,
     messages: [],
+    ledger: [],
     activeAgentIdentity: reviewer.identity,
     agents: [bundledOrchestrator, reviewer],
     catalogRevision: 2,
@@ -82,4 +83,63 @@ test("Chat view renders pasted user Markdown and code through the same safe boun
   assert.match(html, /<strong>this<\/strong>/);
   assert.match(html, /class="language-ts"/);
   assert.match(html, /const answer = 42;/);
+});
+
+test("Chat view exposes cancellation, immutable retry, and partial-output status", () => {
+  const active = renderChatsView(state({
+    chats: [{ chatId: "chat-1", label: "Active", agentIdentity: reviewer.identity, trashed: false, forked: false }],
+    selectedChatId: "chat-1",
+    activeAttemptId: "attempt-1",
+  }));
+  assert.match(active, /data-chat-action="cancel-attempt"/);
+  assert.match(active, /id="chat-input"[^>]+disabled/);
+
+  const cancelled = renderChatsView(state({
+    chats: [{ chatId: "chat-1", label: "Cancelled", agentIdentity: reviewer.identity, trashed: false, forked: false }],
+    selectedChatId: "chat-1",
+    retryAttemptId: "attempt-1",
+    messages: [{ role: "assistant", content: "Partial answer", attemptState: "cancelled" }],
+  }));
+  assert.match(cancelled, /data-chat-action="retry-attempt"/);
+  assert.match(cancelled, /data-attempt-id="attempt-1"/);
+  assert.match(cancelled, /class="attempt-state">cancelled</);
+});
+
+test("Chat view makes versioned summaries and correctable Ledger entries inspectable", () => {
+  const html = renderChatsView(state({
+    chats: [{ chatId: "chat-1", label: "Context", agentIdentity: reviewer.identity, trashed: false, forked: false }],
+    selectedChatId: "chat-1",
+    messages: [{ role: "user", content: "Keep this" }],
+    summary: { content: "The user asked to keep context.", provenance: "explicit:model:test", version: 2 },
+    ledger: [{
+      entryId: "entry-1",
+      kind: "decision",
+      content: "Keep context",
+      provenance: "explicit-user-entry",
+      status: "active",
+    }],
+  }));
+  assert.match(html, /Summary v2/);
+  assert.match(html, /The user asked to keep context/);
+  assert.match(html, /data-chat-action="generate-summary"/);
+  assert.match(html, /data-chat-action="add-ledger-open"/);
+  assert.match(html, /id="ledger-editor-slot"/);
+  assert.match(html, /data-chat-action="correct-ledger-open"/);
+  assert.match(html, /Keep context/);
+});
+
+test("Chat view identifies the Repository Write Lock owner while conversation remains available", () => {
+  const html = renderChatsView(state({ repositoryWriteLockHolder: "task-42" }));
+  assert.match(html, /Repository read-only/);
+  assert.match(html, /Write lock held by task-42/);
+  assert.doesNotMatch(html, /id="chat-input"[^>]+disabled/);
+});
+
+test("Chat view preserves deleted-origin provenance for a surviving fork", () => {
+  const html = renderChatsView(state({
+    chats: [{ chatId: "fork-1", label: "Independent fork", agentIdentity: reviewer.identity, trashed: false, forked: false, forkOriginDeleted: true }],
+    selectedChatId: "fork-1",
+  }));
+  assert.match(html, /Origin deleted/);
+  assert.doesNotMatch(html, /<span class="session-tag">Fork<\/span>/);
 });

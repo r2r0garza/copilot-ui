@@ -65,6 +65,11 @@ test("keeps lifecycle, forks, trash, summaries, ledger, and audits append-only",
   store.transitionAttempt(attempt.attemptId, "running"); store.transitionAttempt(attempt.attemptId, "cancelled");
   const ledger = store.appendLedger(chat.chatId, "fact", "User prefers tests", "user-turn"); store.correctLedger(ledger.entryId, "User prefers focused tests", "user-correction");
   store.createSummary(chat.chatId, "Short history", "turns:1");
+  assert.equal(store.getActiveSummary(chat.chatId)?.content, "Short history");
+  assert.deepEqual(store.listLedger(chat.chatId).map(({ content, status }) => ({ content, status })), [
+    { content: "User prefers tests", status: "superseded" },
+    { content: "User prefers focused tests", status: "active" },
+  ]);
   const denied = store.recordToolIntent({
     operationKey: "d".repeat(64), parentKind: "response-attempt", parentId: attempt.attemptId, effectClass: "repository-write",
     authorityGrantId: null, authorityReviewId: null, resourceSnapshotId: snapshotId, targetFingerprint: "e".repeat(64),
@@ -74,6 +79,54 @@ test("keeps lifecycle, forks, trash, summaries, ledger, and audits append-only",
   assert.equal(store.acquireRepositoryWriteLock(attempt.attemptId), true); assert.equal(store.repositoryWriteLocked(), true); assert.equal(store.releaseRepositoryWriteLock(attempt.attemptId), true);
   const fork = store.forkChat(chat.chatId, "bundled:orchestrator"); store.trashChat(chat.chatId); assert.equal(store.listChats().length, 1); assert.equal(store.listChats()[0]?.chatId, fork.chatId);
   store.restoreChat(chat.chatId); assert.equal(store.listChats().length, 2); store.close();
+});
+
+test("enforces the exact Response Attempt transition matrix and immutable terminal retry", () => {
+  const store = new WorkspaceStore(mkdtempSync(join(tmpdir(), "bridgit-attempt-transitions-")));
+  const chat = store.createChat("bundled:orchestrator", null);
+  const turn = store.submitTurn(chat.chatId, "Retry this durable turn");
+  const first = store.createResponseAttempt(turn.turnId, null);
+  assert.throws(() => store.transitionAttempt(first.attemptId, "succeeded"), /invalid-attempt-transition/);
+  store.transitionAttempt(first.attemptId, "running");
+  store.transitionAttempt(first.attemptId, "waiting-for-approval");
+  store.transitionAttempt(first.attemptId, "running");
+  store.checkpointOutput(turn.turnId, "unfinished");
+  store.transitionAttempt(first.attemptId, "cancelled");
+  assert.throws(() => store.transitionAttempt(first.attemptId, "running"), /invalid-attempt-transition/);
+
+  const retry = store.createResponseAttempt(turn.turnId, null);
+  assert.equal(retry.ordinal, 2);
+  assert.notEqual(retry.attemptId, first.attemptId);
+  assert.equal(store.listOutputs(chat.chatId)[0]?.content, "unfinished");
+  assert.deepEqual(store.listEvents().filter((event) => event.aggregateId === first.attemptId).map((event) => event.name), [
+    "response.started",
+    "response.approval-requested",
+    "response.approval-resolved",
+    "response.cancelled",
+  ]);
+  store.close();
+});
+
+test("forks established transcript and session context without coupling deletion", () => {
+  const store = new WorkspaceStore(mkdtempSync(join(tmpdir(), "bridgit-fork-context-")));
+  const source = store.createChat("bundled:orchestrator", null);
+  const turn = store.submitTurn(source.chatId, "Keep this history");
+  store.appendOutput(turn.turnId, "History kept");
+  store.createSummary(source.chatId, "A compact history", `through-turn:${turn.turnId}`);
+  store.appendLedger(source.chatId, "decision", "Keep tests focused", `turn:${turn.turnId}`);
+
+  const fork = store.forkChat(source.chatId, source.agentIdentity);
+  assert.deepEqual(store.listTurns(fork.chatId).map((item) => item.content), ["Keep this history"]);
+  assert.deepEqual(store.listFinalOutputs(fork.chatId).map((item) => item.content), ["History kept"]);
+  assert.equal(store.getActiveSummary(fork.chatId)?.content, "A compact history");
+  assert.equal(store.listLedger(fork.chatId)[0]?.content, "Keep tests focused");
+
+  store.trashChat(source.chatId);
+  store.deleteChatPermanently(source.chatId, true);
+  assert.equal(store.getChat(fork.chatId)?.originChatId, null);
+  assert.equal(store.getChat(fork.chatId)?.forkOriginDeleted, true);
+  assert.deepEqual(store.listTurns(fork.chatId).map((item) => item.content), ["Keep this history"]);
+  store.close();
 });
 
 test("pins one exact immutable Resource Snapshot identity per preparing attempt", () => {
@@ -164,9 +217,52 @@ test("persists separate fingerprint-bound Chat and Task authority grants", () =>
 });
 
 test("permanent deletion preserves surviving forks without their deleted-origin pointer", () => {
-  const store = new WorkspaceStore(mkdtempSync(join(tmpdir(), "bridgit-fork-delete-")));
+  const directory = mkdtempSync(join(tmpdir(), "bridgit-fork-delete-"));
+  const store = new WorkspaceStore(directory);
   const source = store.createChat("bundled:orchestrator", null); const fork = store.forkChat(source.chatId, "bundled:orchestrator"); store.trashChat(source.chatId); store.deleteChatPermanently(source.chatId, true);
-  assert.equal(store.getChat(source.chatId), undefined); assert.equal(store.getChat(fork.chatId)?.originChatId, null); store.close();
+  assert.equal(store.getChat(source.chatId), undefined); assert.equal(store.getChat(fork.chatId)?.originChatId, null); assert.equal(store.getChat(fork.chatId)?.forkOriginDeleted, true); store.close();
+
+  const legacy = new Database(join(directory, "bridgit.sqlite"));
+  legacy.prepare("UPDATE chat_sessions SET fork_origin_deleted = 0 WHERE chat_id = ?").run(fork.chatId);
+  legacy.close();
+  const migrated = new WorkspaceStore(directory);
+  assert.equal(migrated.getChat(fork.chatId)?.forkOriginDeleted, true);
+  migrated.close();
+});
+
+test("permanent deletion removes the named Chat's Tool records and restores append-only audit guards", () => {
+  const directory = mkdtempSync(join(tmpdir(), "bridgit-tool-delete-"));
+  const store = new WorkspaceStore(directory);
+  const first = store.createChat("bundled:orchestrator", null);
+  const firstTurn = store.submitTurn(first.chatId, "Use a denied Tool");
+  const firstAttempt = store.createResponseAttempt(firstTurn.turnId, null);
+  const firstSnapshot = snapshotFixture({ attemptId: firstAttempt.attemptId });
+  store.pinResourceSnapshot(firstAttempt.attemptId, firstSnapshot.snapshotId, firstSnapshot.content);
+  const firstOperation = store.recordToolIntent({
+    operationKey: "1".repeat(64), parentKind: "response-attempt", parentId: firstAttempt.attemptId, effectClass: "repository-write",
+    authorityGrantId: null, authorityReviewId: null, resourceSnapshotId: firstSnapshot.snapshotId, targetFingerprint: "2".repeat(64),
+    toolIdentity: "files/write", decisionCode: "denied", input: { path: "private.txt" }, affectedTargets: ["repo:private.txt"],
+  });
+  store.transitionAttempt(firstAttempt.attemptId, "blocked");
+  store.trashChat(first.chatId);
+  assert.doesNotThrow(() => store.deleteChatPermanently(first.chatId, true));
+  assert.equal(store.getChat(first.chatId), undefined);
+  assert.equal(store.getDurableOperation(firstOperation.operationId), undefined);
+
+  const second = store.createChat("bundled:orchestrator", null);
+  const secondTurn = store.submitTurn(second.chatId, "Keep this audit");
+  const secondAttempt = store.createResponseAttempt(secondTurn.turnId, null);
+  const secondSnapshot = snapshotFixture({ attemptId: secondAttempt.attemptId });
+  store.pinResourceSnapshot(secondAttempt.attemptId, secondSnapshot.snapshotId, secondSnapshot.content);
+  const secondOperation = store.recordToolIntent({
+    operationKey: "3".repeat(64), parentKind: "response-attempt", parentId: secondAttempt.attemptId, effectClass: "read",
+    authorityGrantId: null, authorityReviewId: null, resourceSnapshotId: secondSnapshot.snapshotId, targetFingerprint: "4".repeat(64),
+    toolIdentity: "files/read", decisionCode: "denied", input: { path: "README.md" }, affectedTargets: ["repo:README.md"],
+  });
+  const database = new Database(join(directory, "bridgit.sqlite"));
+  assert.throws(() => database.prepare("DELETE FROM tool_audit_records WHERE operation_id = ?").run(secondOperation.operationId), /tool-audit-append-only/);
+  database.close();
+  store.close();
 });
 
 test("permanent deletion supports legacy databases whose Chat foreign keys do not cascade", () => {

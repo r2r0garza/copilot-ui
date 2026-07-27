@@ -27,13 +27,14 @@ import {
 } from "../../features/execution-authority";
 
 export interface ArtifactRef { readonly artifactId: string; readonly mediaType: string; readonly byteCount: number; readonly checksum: string; readonly displayLabel: string; }
-export interface ChatRecord { readonly chatId: string; readonly title: string; readonly version: number; readonly agentIdentity: string; readonly requestedModelId: string | null; readonly createdAt: string; readonly updatedAt: string; readonly originChatId: string | null; readonly trashedAt: string | null; }
+export interface ChatRecord { readonly chatId: string; readonly title: string; readonly version: number; readonly agentIdentity: string; readonly requestedModelId: string | null; readonly createdAt: string; readonly updatedAt: string; readonly originChatId: string | null; readonly forkOriginDeleted: boolean; readonly trashedAt: string | null; }
 export interface TurnRecord { readonly turnId: string; readonly chatId: string; readonly ordinal: number; readonly content: string; readonly submittedAt: string; }
 export type AttemptState = "preparing" | "running" | "waiting-for-approval" | "succeeded" | "blocked" | "failed" | "cancelled" | "interrupted";
 export interface ResponseAttemptRecord { readonly attemptId: string; readonly turnId: string; readonly ordinal: number; readonly state: AttemptState; readonly requestedModelId: string | null; readonly effectiveModelId: string | null; readonly snapshotId: string | null; readonly createdAt: string; readonly endedAt: string | null; }
 export interface OutputRecord { readonly outputId: string; readonly turnId: string; readonly content: string; readonly createdAt: string; }
 export interface EventRecord { readonly sequence: number; readonly name: string; readonly aggregateId: string; readonly payload: string; readonly emittedAt: string; }
 export interface LedgerEntry { readonly entryId: string; readonly chatId: string; readonly kind: string; readonly content: string; readonly provenance: string; readonly status: "active" | "superseded" | "disputed"; readonly createdAt: string; }
+export interface SummaryRecord { readonly summaryId: string; readonly chatId: string; readonly content: string; readonly provenance: string; readonly active: boolean; readonly createdAt: string; }
 export interface ResourceSnapshotRecord { readonly snapshotId: string; readonly attemptId: string; readonly content: string; readonly createdAt: string; }
 export interface McpTrustRecord { readonly serverIdentity: string; readonly fingerprint: string; readonly version: number; readonly decision: "trusted" | "denied"; readonly decidedAt: string; readonly invalidatedAt: string | null; }
 
@@ -52,7 +53,7 @@ export class WorkspaceStore {
   }
 
   public createChat(agentIdentity: string, requestedModelId: string | null, now = new Date().toISOString()): ChatRecord {
-    const chat: ChatRecord = { chatId: randomUUID(), title: "New chat", version: 1, agentIdentity, requestedModelId, createdAt: now, updatedAt: now, originChatId: null, trashedAt: null };
+    const chat: ChatRecord = { chatId: randomUUID(), title: "New chat", version: 1, agentIdentity, requestedModelId, createdAt: now, updatedAt: now, originChatId: null, forkOriginDeleted: false, trashedAt: null };
     this.transaction(() => { this.db.prepare("INSERT INTO chat_sessions (chat_id, title, version, agent_identity, requested_model_id, created_at, updated_at, origin_chat_id, trashed_at) VALUES (@chatId, @title, @version, @agentIdentity, @requestedModelId, @createdAt, @updatedAt, @originChatId, @trashedAt)").run(chat); this.appendEvent("chat.session-created", chat.chatId, JSON.stringify(chat), now); });
     return chat;
   }
@@ -72,14 +73,58 @@ export class WorkspaceStore {
     const attempt: ResponseAttemptRecord = { attemptId: randomUUID(), turnId, ordinal: row.count + 1, state: "preparing", requestedModelId, effectiveModelId, snapshotId: null, createdAt: now, endedAt: null };
     this.transaction(() => { this.db.prepare("INSERT INTO response_attempts (attempt_id, turn_id, ordinal, state, requested_model_id, created_at, effective_model_id, snapshot_id, ended_at) VALUES (@attemptId, @turnId, @ordinal, @state, @requestedModelId, @createdAt, @effectiveModelId, @snapshotId, @endedAt)").run(attempt); this.appendEvent("response.preparation-started", turnId, JSON.stringify(attempt), now); }); return attempt;
   }
-  public transitionAttempt(attemptId: string, state: AttemptState, now = new Date().toISOString()): void { const terminal = ["succeeded", "blocked", "failed", "cancelled", "interrupted"].includes(state); this.transaction(() => { const result = this.db.prepare("UPDATE response_attempts SET state = ?, ended_at = CASE WHEN ? THEN ? ELSE ended_at END WHERE attempt_id = ? AND state IN ('preparing','running','waiting-for-approval')").run(state, terminal ? 1 : 0, now, attemptId); if (result.changes !== 1) throw new Error("invalid-attempt-transition"); this.appendEvent(`response.${state}`, attemptId, JSON.stringify({ state }), now); }); }
+  public transitionAttempt(attemptId: string, state: AttemptState, now = new Date().toISOString()): void {
+    const current = this.getResponseAttempt(attemptId);
+    if (!current || !validAttemptTransition(current.state, state)) throw new Error("invalid-attempt-transition");
+    const terminal = isTerminalAttemptState(state);
+    this.transaction(() => {
+      const result = this.db.prepare("UPDATE response_attempts SET state = ?, ended_at = CASE WHEN ? THEN ? ELSE ended_at END WHERE attempt_id = ? AND state = ?").run(state, terminal ? 1 : 0, now, attemptId, current.state);
+      if (result.changes !== 1) throw new Error("invalid-attempt-transition");
+      this.appendEvent(attemptEvent(current.state, state), attemptId, JSON.stringify({ state }), now);
+    });
+  }
   /** Stores the latest visible stream text so an interrupted extension host can restore it on reload. */
   public checkpointOutput(turnId: string, content: string, now = new Date().toISOString()): void { this.transaction(() => { this.db.prepare("INSERT INTO chat_stream_outputs (turn_id, content, updated_at) VALUES (?, ?, ?) ON CONFLICT(turn_id) DO UPDATE SET content = excluded.content, updated_at = excluded.updated_at").run(turnId, content, now); this.appendEvent("chat.output-checkpointed", turnId, JSON.stringify({ byteCount: Buffer.byteLength(content, "utf8") }), now); }); }
   public appendOutput(turnId: string, content: string, now = new Date().toISOString()): OutputRecord { const output: OutputRecord = { outputId: randomUUID(), turnId, content, createdAt: now }; this.transaction(() => { const artifact = this.createArtifact("text/plain", content, "Assistant response"); this.db.prepare("INSERT INTO chat_outputs VALUES (?, ?, ?, ?)").run(output.outputId, turnId, artifact.artifactId, now); this.db.prepare("DELETE FROM chat_stream_outputs WHERE turn_id = ?").run(turnId); this.appendEvent("chat.output-appended", turnId, JSON.stringify({ ...output, content: undefined }), now); }); return output; }
 
-  public forkChat(chatId: string, agentIdentity: string, now = new Date().toISOString()): ChatRecord { const source = this.getChat(chatId); if (!source) throw new Error("chat-not-found"); const fork: ChatRecord = { chatId: randomUUID(), title: `${source.title} (fork)`, version: 1, agentIdentity, requestedModelId: null, createdAt: now, updatedAt: now, originChatId: chatId, trashedAt: null }; this.transaction(() => { this.db.prepare("INSERT INTO chat_sessions (chat_id, title, version, agent_identity, requested_model_id, created_at, updated_at, origin_chat_id, trashed_at) VALUES (@chatId, @title, @version, @agentIdentity, @requestedModelId, @createdAt, @updatedAt, @originChatId, @trashedAt)").run(fork); this.appendEvent("chat.fork-created", fork.chatId, JSON.stringify({ originChatId: chatId }), now); }); return fork; }
+  public forkChat(chatId: string, agentIdentity: string, now = new Date().toISOString()): ChatRecord {
+    const source = this.getChat(chatId);
+    if (!source) throw new Error("chat-not-found");
+    const fork: ChatRecord = { chatId: randomUUID(), title: `${source.title} (fork)`, version: 1, agentIdentity, requestedModelId: source.requestedModelId, createdAt: now, updatedAt: now, originChatId: chatId, forkOriginDeleted: false, trashedAt: null };
+    const turns = this.listTurns(chatId);
+    const outputs = this.listFinalOutputs(chatId);
+    const summaries = this.listSummaries(chatId);
+    const ledger = this.listLedger(chatId);
+    this.transaction(() => {
+      this.db.prepare("INSERT INTO chat_sessions (chat_id, title, version, agent_identity, requested_model_id, created_at, updated_at, origin_chat_id, trashed_at) VALUES (@chatId, @title, @version, @agentIdentity, @requestedModelId, @createdAt, @updatedAt, @originChatId, @trashedAt)").run(fork);
+      for (const turn of turns) {
+        const clonedTurnId = randomUUID();
+        const artifact = this.createArtifact("text/plain", turn.content, "Forked Chat turn");
+        this.db.prepare("INSERT INTO chat_turns VALUES (?, ?, ?, ?, ?)").run(clonedTurnId, fork.chatId, turn.ordinal, artifact.artifactId, turn.submittedAt);
+        for (const output of outputs.filter((candidate) => candidate.turnId === turn.turnId)) {
+          const outputArtifact = this.createArtifact("text/plain", output.content, "Forked assistant response");
+          this.db.prepare("INSERT INTO chat_outputs VALUES (?, ?, ?, ?)").run(randomUUID(), clonedTurnId, outputArtifact.artifactId, output.createdAt);
+        }
+      }
+      for (const summary of summaries) this.db.prepare("INSERT INTO chat_summaries VALUES (?, ?, ?, ?, ?, ?)").run(randomUUID(), fork.chatId, summary.content, `fork:${chatId}:${summary.summaryId}`, summary.active ? 1 : 0, summary.createdAt);
+      for (const entry of ledger) this.db.prepare("INSERT INTO session_ledger VALUES (?, ?, ?, ?, ?, ?, ?)").run(randomUUID(), fork.chatId, entry.kind, entry.content, `fork:${chatId}:${entry.entryId}`, entry.status, entry.createdAt);
+      this.appendEvent("chat.fork-created", fork.chatId, JSON.stringify({ originChatId: chatId, throughTurnOrdinal: turns.at(-1)?.ordinal ?? 0 }), now);
+    });
+    return fork;
+  }
   public setChatTitle(chatId: string, title: string, now = new Date().toISOString()): void { const clean = title.trim().replace(/\s+/g, " ").slice(0, 96); if (!clean) throw new Error("chat-title-empty"); this.transaction(() => { const result = this.db.prepare("UPDATE chat_sessions SET title = ?, updated_at = ? WHERE chat_id = ?").run(clean, now, chatId); if (result.changes !== 1) throw new Error("chat-not-found"); this.appendEvent("chat.title-set", chatId, JSON.stringify({ title: clean }), now); }); }
-  public trashChat(chatId: string, now = new Date().toISOString()): void { this.transaction(() => { this.db.prepare("UPDATE response_attempts SET state = 'cancelled', ended_at = ? WHERE attempt_id IN (SELECT a.attempt_id FROM response_attempts a JOIN chat_turns t ON t.turn_id = a.turn_id WHERE t.chat_id = ? AND a.state IN ('preparing','running','waiting-for-approval'))").run(now, chatId); const result = this.db.prepare("UPDATE chat_sessions SET trashed_at = ? WHERE chat_id = ? AND trashed_at IS NULL").run(now, chatId); if (result.changes !== 1) throw new Error("chat-not-found-or-already-trashed"); this.appendEvent("chat.trashed", chatId, "{}", now); }); }
+  public trashChat(chatId: string, now = new Date().toISOString()): void {
+    const activeAttempts = this.db.prepare("SELECT a.attempt_id AS attemptId FROM response_attempts a JOIN chat_turns t ON t.turn_id = a.turn_id WHERE t.chat_id = ? AND a.state IN ('preparing','running','waiting-for-approval')").all(chatId) as { attemptId: string }[];
+    this.transaction(() => {
+      for (const { attemptId } of activeAttempts) {
+        this.db.prepare("UPDATE response_attempts SET state = 'cancelled', ended_at = ? WHERE attempt_id = ?").run(now, attemptId);
+        this.appendEvent("response.cancelled", attemptId, JSON.stringify({ reason: "chat-trashed" }), now);
+      }
+      const result = this.db.prepare("UPDATE chat_sessions SET trashed_at = ? WHERE chat_id = ? AND trashed_at IS NULL").run(now, chatId);
+      if (result.changes !== 1) throw new Error("chat-not-found-or-already-trashed");
+      this.appendEvent("chat.trashed", chatId, "{}", now);
+    });
+  }
   public restoreChat(chatId: string, now = new Date().toISOString()): void { this.transaction(() => { const result = this.db.prepare("UPDATE chat_sessions SET trashed_at = NULL WHERE chat_id = ? AND trashed_at IS NOT NULL").run(chatId); if (result.changes !== 1) throw new Error("chat-not-trashed"); this.appendEvent("chat.restored", chatId, "{}", now); }); }
   public deleteChatPermanently(chatId: string, confirmed: boolean, now = new Date().toISOString()): void {
     if (!confirmed) throw new Error("permanent-delete-requires-confirmation");
@@ -91,7 +136,22 @@ export class WorkspaceStore {
     if (unsettledOperation) throw new Error("chat-has-unsettled-tool-operation");
     const artifacts = this.db.prepare("SELECT content_artifact_id AS artifactId FROM chat_turns WHERE chat_id = ? UNION SELECT o.artifact_id AS artifactId FROM chat_outputs o JOIN chat_turns t ON t.turn_id = o.turn_id WHERE t.chat_id = ?").all(chatId, chatId) as { artifactId: string }[];
     this.transaction(() => {
-      this.db.prepare("UPDATE chat_sessions SET origin_chat_id = NULL WHERE origin_chat_id = ?").run(chatId);
+      // Permanent Chat deletion is the one explicit privacy boundary allowed to
+      // remove append-only audit rows. The triggers are restored in the same
+      // transaction; any failure rolls both data and schema changes back.
+      this.dropAppendOnlyDeletionTriggers();
+      this.db.prepare("UPDATE chat_sessions SET origin_chat_id = NULL, fork_origin_deleted = 1 WHERE origin_chat_id = ?").run(chatId);
+      const operationIds = this.db.prepare("SELECT o.operation_id AS operationId FROM durable_operations o JOIN response_attempts a ON o.parent_kind = 'response-attempt' AND o.parent_id = a.attempt_id JOIN chat_turns t ON t.turn_id = a.turn_id WHERE t.chat_id = ?").all(chatId) as { operationId: string }[];
+      for (const { operationId } of operationIds) {
+        this.db.prepare("DELETE FROM tool_audit_corrections WHERE audit_id IN (SELECT audit_id FROM tool_audit_records WHERE operation_id = ?)").run(operationId);
+        this.db.prepare("DELETE FROM tool_audit_records WHERE operation_id = ?").run(operationId);
+        this.db.prepare("DELETE FROM reconciliation_evidence WHERE operation_id = ?").run(operationId);
+        this.db.prepare("DELETE FROM operation_execution_attempts WHERE operation_id = ?").run(operationId);
+        this.db.prepare("DELETE FROM operation_barriers WHERE operation_id = ?").run(operationId);
+        this.db.prepare("DELETE FROM durable_operations WHERE operation_id = ?").run(operationId);
+      }
+      this.db.prepare("DELETE FROM authority_grants WHERE owner_kind = 'chat' AND owner_id = ?").run(chatId);
+      this.db.prepare("DELETE FROM authority_reviews WHERE owner_kind = 'chat' AND owner_id = ?").run(chatId);
       this.db.prepare("DELETE FROM resource_snapshots WHERE attempt_id IN (SELECT a.attempt_id FROM response_attempts a JOIN chat_turns t ON t.turn_id = a.turn_id WHERE t.chat_id = ?)").run(chatId);
       this.db.prepare("DELETE FROM tool_audits WHERE attempt_id IN (SELECT a.attempt_id FROM response_attempts a JOIN chat_turns t ON t.turn_id = a.turn_id WHERE t.chat_id = ?)").run(chatId);
       this.db.prepare("DELETE FROM chat_stream_outputs WHERE turn_id IN (SELECT turn_id FROM chat_turns WHERE chat_id = ?)").run(chatId);
@@ -103,11 +163,32 @@ export class WorkspaceStore {
       this.db.prepare("DELETE FROM chat_sessions WHERE chat_id = ?").run(chatId);
       for (const artifact of artifacts) this.db.prepare("DELETE FROM artifacts WHERE artifact_id = ?").run(artifact.artifactId);
       this.appendEvent("chat.permanently-deleted", chatId, "{}", now);
+      this.installAppendOnlyDeletionTriggers();
     });
   }
-  public createSummary(chatId: string, content: string, provenance: string, now = new Date().toISOString()): string { const summaryId = randomUUID(); this.transaction(() => { this.db.prepare("UPDATE chat_summaries SET active = 0 WHERE chat_id = ? AND active = 1").run(chatId); this.db.prepare("INSERT INTO chat_summaries VALUES (?, ?, ?, ?, 1, ?)").run(summaryId, chatId, content, provenance, now); this.appendEvent("chat.summary-created", chatId, JSON.stringify({ summaryId }), now); }); return summaryId; }
-  public appendLedger(chatId: string, kind: string, content: string, provenance: string, now = new Date().toISOString()): LedgerEntry { const entry: LedgerEntry = { entryId: randomUUID(), chatId, kind, content, provenance, status: "active", createdAt: now }; this.transaction(() => { this.db.prepare("INSERT INTO session_ledger VALUES (@entryId, @chatId, @kind, @content, @provenance, @status, @createdAt)").run(entry); this.appendEvent("chat.ledger-appended", chatId, JSON.stringify({ entryId: entry.entryId }), now); }); return entry; }
-  public correctLedger(entryId: string, content: string, provenance: string, now = new Date().toISOString()): LedgerEntry { const prior = this.db.prepare("SELECT entry_id as entryId, chat_id as chatId, kind, content, provenance, status, created_at as createdAt FROM session_ledger WHERE entry_id = ?").get(entryId) as LedgerEntry | undefined; if (!prior) throw new Error("ledger-entry-not-found"); const replacement = this.appendLedger(prior.chatId, prior.kind, content, provenance, now); this.db.prepare("UPDATE session_ledger SET status = 'superseded' WHERE entry_id = ?").run(entryId); return replacement; }
+  public createSummary(chatId: string, content: string, provenance: string, now = new Date().toISOString()): string { const summaryId = randomUUID(); if (!this.getChat(chatId)) throw new Error("chat-not-found"); if (!content.trim()) throw new Error("summary-empty"); this.transaction(() => { this.db.prepare("UPDATE chat_summaries SET active = 0 WHERE chat_id = ? AND active = 1").run(chatId); this.db.prepare("INSERT INTO chat_summaries VALUES (?, ?, ?, ?, 1, ?)").run(summaryId, chatId, content.trim(), provenance, now); this.appendEvent("chat.summary-created", chatId, JSON.stringify({ summaryId }), now); }); return summaryId; }
+  public appendLedger(chatId: string, kind: string, content: string, provenance: string, now = new Date().toISOString()): LedgerEntry {
+    if (!this.getChat(chatId)) throw new Error("chat-not-found");
+    const entry = ledgerRecord(chatId, kind, content, provenance, now);
+    this.transaction(() => {
+      this.db.prepare("INSERT INTO session_ledger VALUES (@entryId, @chatId, @kind, @content, @provenance, @status, @createdAt)").run(entry);
+      this.appendEvent("chat.ledger-entry-changed", chatId, JSON.stringify({ entryId: entry.entryId, status: entry.status }), now);
+    });
+    return entry;
+  }
+  public correctLedger(entryId: string, content: string, provenance: string, now = new Date().toISOString()): LedgerEntry {
+    const prior = this.db.prepare("SELECT entry_id as entryId, chat_id as chatId, kind, content, provenance, status, created_at as createdAt FROM session_ledger WHERE entry_id = ?").get(entryId) as LedgerEntry | undefined;
+    if (!prior) throw new Error("ledger-entry-not-found");
+    if (prior.status !== "active") throw new Error("ledger-entry-not-active");
+    const replacement = ledgerRecord(prior.chatId, prior.kind, content, provenance, now);
+    this.transaction(() => {
+      const changed = this.db.prepare("UPDATE session_ledger SET status = 'superseded' WHERE entry_id = ? AND status = 'active'").run(entryId);
+      if (changed.changes !== 1) throw new Error("ledger-entry-not-active");
+      this.db.prepare("INSERT INTO session_ledger VALUES (@entryId, @chatId, @kind, @content, @provenance, @status, @createdAt)").run(replacement);
+      this.appendEvent("chat.ledger-entry-changed", prior.chatId, JSON.stringify({ entryId: replacement.entryId, supersedes: entryId, status: replacement.status }), now);
+    });
+    return replacement;
+  }
   public recordToolIntent(input: RecordToolIntent, now = new Date().toISOString()): DurableOperation {
     validateHash(input.operationKey, "operation-key");
     validateHash(input.targetFingerprint, "target-fingerprint");
@@ -347,10 +428,17 @@ export class WorkspaceStore {
   public acquireRepositoryWriteLock(holderId: string, now = new Date().toISOString()): boolean { const result = this.db.prepare("INSERT INTO repository_write_lock (lock_id, holder_id, acquired_at) VALUES (1, ?, ?) ON CONFLICT(lock_id) DO NOTHING").run(holderId, now); if (result.changes) this.appendEvent("repository.write-lock-acquired", holderId, "{}", now); return result.changes === 1; }
   public releaseRepositoryWriteLock(holderId: string, now = new Date().toISOString()): boolean { const result = this.db.prepare("DELETE FROM repository_write_lock WHERE lock_id = 1 AND holder_id = ?").run(holderId); if (result.changes) this.appendEvent("repository.write-lock-released", holderId, "{}", now); return result.changes === 1; }
   public repositoryWriteLocked(): boolean { return Boolean(this.db.prepare("SELECT 1 FROM repository_write_lock WHERE lock_id = 1").get()); }
-  public getChat(chatId: string): ChatRecord | undefined { return this.db.prepare("SELECT chat_id as chatId, title, version, agent_identity as agentIdentity, requested_model_id as requestedModelId, created_at as createdAt, updated_at as updatedAt, origin_chat_id as originChatId, trashed_at as trashedAt FROM chat_sessions WHERE chat_id = ?").get(chatId) as ChatRecord | undefined; }
-  public listChats(includeTrash = false): readonly ChatRecord[] { return this.db.prepare(`SELECT chat_id as chatId, title, version, agent_identity as agentIdentity, requested_model_id as requestedModelId, created_at as createdAt, updated_at as updatedAt, origin_chat_id as originChatId, trashed_at as trashedAt FROM chat_sessions ${includeTrash ? "" : "WHERE trashed_at IS NULL"} ORDER BY created_at`).all() as ChatRecord[]; }
+  public repositoryWriteLockHolder(): string | undefined { return (this.db.prepare("SELECT holder_id AS holderId FROM repository_write_lock WHERE lock_id = 1").get() as { holderId: string } | undefined)?.holderId; }
+  public getChat(chatId: string): ChatRecord | undefined { const row = this.db.prepare("SELECT chat_id as chatId, title, version, agent_identity as agentIdentity, requested_model_id as requestedModelId, created_at as createdAt, updated_at as updatedAt, origin_chat_id as originChatId, fork_origin_deleted as forkOriginDeleted, trashed_at as trashedAt FROM chat_sessions WHERE chat_id = ?").get(chatId) as (Omit<ChatRecord, "forkOriginDeleted"> & { forkOriginDeleted: number }) | undefined; return row ? { ...row, forkOriginDeleted: Boolean(row.forkOriginDeleted) } : undefined; }
+  public listChats(includeTrash = false): readonly ChatRecord[] { const rows = this.db.prepare(`SELECT chat_id as chatId, title, version, agent_identity as agentIdentity, requested_model_id as requestedModelId, created_at as createdAt, updated_at as updatedAt, origin_chat_id as originChatId, fork_origin_deleted as forkOriginDeleted, trashed_at as trashedAt FROM chat_sessions ${includeTrash ? "" : "WHERE trashed_at IS NULL"} ORDER BY created_at`).all() as Array<Omit<ChatRecord, "forkOriginDeleted"> & { forkOriginDeleted: number }>; return rows.map((row) => ({ ...row, forkOriginDeleted: Boolean(row.forkOriginDeleted) })); }
   public listTurns(chatId: string): readonly TurnRecord[] { return (this.db.prepare("SELECT t.turn_id as turnId, t.chat_id as chatId, t.ordinal, a.content, t.submitted_at as submittedAt FROM chat_turns t JOIN artifacts a ON a.artifact_id = t.content_artifact_id WHERE t.chat_id = ? ORDER BY t.ordinal").all(chatId) as TurnRecord[]); }
   public listOutputs(chatId: string): readonly OutputRecord[] { return this.db.prepare("SELECT o.output_id as outputId, o.turn_id as turnId, a.content, o.created_at as createdAt FROM chat_outputs o JOIN chat_turns t ON t.turn_id = o.turn_id JOIN artifacts a ON a.artifact_id = o.artifact_id WHERE t.chat_id = ? UNION ALL SELECT 'stream:' || s.turn_id as outputId, s.turn_id as turnId, s.content, s.updated_at as createdAt FROM chat_stream_outputs s JOIN chat_turns t ON t.turn_id = s.turn_id WHERE t.chat_id = ? ORDER BY createdAt").all(chatId, chatId) as OutputRecord[]; }
+  public listFinalOutputs(chatId: string): readonly OutputRecord[] { return this.db.prepare("SELECT o.output_id as outputId, o.turn_id as turnId, a.content, o.created_at as createdAt FROM chat_outputs o JOIN chat_turns t ON t.turn_id = o.turn_id JOIN artifacts a ON a.artifact_id = o.artifact_id WHERE t.chat_id = ? ORDER BY o.created_at").all(chatId) as OutputRecord[]; }
+  public listResponseAttempts(chatId: string): readonly ResponseAttemptRecord[] { return this.db.prepare("SELECT a.attempt_id AS attemptId, a.turn_id AS turnId, a.ordinal, a.state, a.requested_model_id AS requestedModelId, a.effective_model_id AS effectiveModelId, a.snapshot_id AS snapshotId, a.created_at AS createdAt, a.ended_at AS endedAt FROM response_attempts a JOIN chat_turns t ON t.turn_id = a.turn_id WHERE t.chat_id = ? ORDER BY a.created_at, a.ordinal").all(chatId) as ResponseAttemptRecord[]; }
+  public listSummaries(chatId: string): readonly SummaryRecord[] { const rows = this.db.prepare("SELECT summary_id AS summaryId, chat_id AS chatId, content, provenance, active, created_at AS createdAt FROM chat_summaries WHERE chat_id = ? ORDER BY created_at").all(chatId) as Array<Omit<SummaryRecord, "active"> & { active: number }>; return rows.map((row) => ({ ...row, active: Boolean(row.active) })); }
+  public getActiveSummary(chatId: string): SummaryRecord | undefined { return this.listSummaries(chatId).find((summary) => summary.active); }
+  public listLedger(chatId: string): readonly LedgerEntry[] { return this.db.prepare("SELECT entry_id as entryId, chat_id as chatId, kind, content, provenance, status, created_at as createdAt FROM session_ledger WHERE chat_id = ? ORDER BY created_at").all(chatId) as LedgerEntry[]; }
+  public attemptHasUnsettledOperation(attemptId: string): boolean { return Boolean(this.db.prepare("SELECT 1 FROM durable_operations WHERE parent_kind = 'response-attempt' AND parent_id = ? AND state IN ('executing','reconciling','outcome-unknown')").get(attemptId)); }
   public getResponseAttempt(attemptId: string): ResponseAttemptRecord | undefined { return this.db.prepare("SELECT attempt_id AS attemptId, turn_id AS turnId, ordinal, state, requested_model_id AS requestedModelId, effective_model_id AS effectiveModelId, snapshot_id AS snapshotId, created_at AS createdAt, ended_at AS endedAt FROM response_attempts WHERE attempt_id = ?").get(attemptId) as ResponseAttemptRecord | undefined; }
   public getResourceSnapshot(attemptId: string): ResourceSnapshotRecord | undefined { return this.db.prepare("SELECT snapshot_id AS snapshotId, attempt_id AS attemptId, content, created_at AS createdAt FROM resource_snapshots WHERE attempt_id = ?").get(attemptId) as ResourceSnapshotRecord | undefined; }
   public getDurableOperation(operationId: string): DurableOperation | undefined {
@@ -423,14 +511,23 @@ export class WorkspaceStore {
     this.db.exec("CREATE TABLE IF NOT EXISTS artifacts (artifact_id TEXT PRIMARY KEY, media_type TEXT NOT NULL, byte_count INTEGER NOT NULL, checksum TEXT NOT NULL, display_label TEXT NOT NULL, content TEXT NOT NULL); CREATE TABLE IF NOT EXISTS chat_sessions (chat_id TEXT PRIMARY KEY, title TEXT NOT NULL DEFAULT 'New chat', version INTEGER NOT NULL, agent_identity TEXT NOT NULL, requested_model_id TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, origin_chat_id TEXT REFERENCES chat_sessions(chat_id), trashed_at TEXT); CREATE TABLE IF NOT EXISTS chat_turns (turn_id TEXT PRIMARY KEY, chat_id TEXT NOT NULL REFERENCES chat_sessions(chat_id) ON DELETE CASCADE, ordinal INTEGER NOT NULL, content_artifact_id TEXT NOT NULL REFERENCES artifacts(artifact_id), submitted_at TEXT NOT NULL, UNIQUE(chat_id, ordinal)); CREATE TABLE IF NOT EXISTS response_attempts (attempt_id TEXT PRIMARY KEY, turn_id TEXT NOT NULL REFERENCES chat_turns(turn_id) ON DELETE CASCADE, ordinal INTEGER NOT NULL, state TEXT NOT NULL, requested_model_id TEXT, created_at TEXT NOT NULL, effective_model_id TEXT, snapshot_id TEXT, ended_at TEXT, UNIQUE(turn_id, ordinal)); CREATE TABLE IF NOT EXISTS chat_outputs (output_id TEXT PRIMARY KEY, turn_id TEXT NOT NULL REFERENCES chat_turns(turn_id) ON DELETE CASCADE, artifact_id TEXT NOT NULL REFERENCES artifacts(artifact_id), created_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS chat_stream_outputs (turn_id TEXT PRIMARY KEY REFERENCES chat_turns(turn_id) ON DELETE CASCADE, content TEXT NOT NULL, updated_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS chat_summaries (summary_id TEXT PRIMARY KEY, chat_id TEXT NOT NULL REFERENCES chat_sessions(chat_id) ON DELETE CASCADE, content TEXT NOT NULL, provenance TEXT NOT NULL, active INTEGER NOT NULL, created_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS session_ledger (entry_id TEXT PRIMARY KEY, chat_id TEXT NOT NULL REFERENCES chat_sessions(chat_id) ON DELETE CASCADE, kind TEXT NOT NULL, content TEXT NOT NULL, provenance TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS resource_snapshots (snapshot_id TEXT PRIMARY KEY, attempt_id TEXT NOT NULL REFERENCES response_attempts(attempt_id) ON DELETE CASCADE, content TEXT NOT NULL, created_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS repository_write_lock (lock_id INTEGER PRIMARY KEY CHECK(lock_id = 1), holder_id TEXT NOT NULL, acquired_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS mcp_trust (server_identity TEXT NOT NULL, fingerprint TEXT NOT NULL, version INTEGER NOT NULL, decision TEXT NOT NULL CHECK(decision IN ('trusted','denied')), decided_at TEXT NOT NULL, invalidated_at TEXT, PRIMARY KEY(server_identity, fingerprint)); CREATE TABLE IF NOT EXISTS tool_audits (audit_id TEXT PRIMARY KEY, attempt_id TEXT NOT NULL REFERENCES response_attempts(attempt_id) ON DELETE CASCADE, operation_key TEXT NOT NULL, tool_identity TEXT NOT NULL, snapshot_id TEXT NOT NULL, decision TEXT NOT NULL, input TEXT NOT NULL, outcome TEXT, created_at TEXT NOT NULL, completed_at TEXT); CREATE TABLE IF NOT EXISTS projection_events (sequence INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, aggregate_id TEXT NOT NULL, payload TEXT NOT NULL, emitted_at TEXT NOT NULL);");
     this.db.exec("CREATE TABLE IF NOT EXISTS authority_reviews (review_id TEXT PRIMARY KEY, owner_kind TEXT NOT NULL CHECK(owner_kind IN ('chat','task')), owner_id TEXT NOT NULL, version INTEGER NOT NULL, grant_scope TEXT NOT NULL CHECK(grant_scope IN ('chat-once','chat-session','task')), effect_class TEXT NOT NULL CHECK(effect_class IN ('read','repository-write','ambient')), requested_scope_json TEXT NOT NULL, resource_snapshot_id TEXT, logical_scope TEXT NOT NULL, risk_summary TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('open','approved','denied','stale','cancelled')), decision TEXT CHECK(decision IN ('approved','denied')), confirmation_hash TEXT, created_at TEXT NOT NULL, resolved_at TEXT); CREATE TABLE IF NOT EXISTS authority_grants (grant_id TEXT PRIMARY KEY, review_id TEXT NOT NULL REFERENCES authority_reviews(review_id) ON DELETE RESTRICT, scope_json TEXT NOT NULL, effect_class TEXT NOT NULL CHECK(effect_class IN ('read','repository-write','ambient')), owner_kind TEXT NOT NULL CHECK(owner_kind IN ('chat','task')), owner_id TEXT NOT NULL, resource_snapshot_id TEXT, fingerprint TEXT NOT NULL, issued_at TEXT NOT NULL, expires_at TEXT, revoked_at TEXT, consumed_at TEXT);");
     this.db.exec("CREATE TABLE IF NOT EXISTS durable_operations (operation_id TEXT PRIMARY KEY, version INTEGER NOT NULL, operation_key TEXT NOT NULL UNIQUE, parent_kind TEXT NOT NULL CHECK(parent_kind IN ('response-attempt','assignment-attempt')), parent_id TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('intent-recorded','executing','retry-wait','reconciling','outcome-unknown','succeeded','failed','cancelled')), effect_class TEXT NOT NULL CHECK(effect_class IN ('read','repository-write','ambient')), intent_fingerprint TEXT NOT NULL, authority_grant_id TEXT REFERENCES authority_grants(grant_id) ON DELETE RESTRICT, resource_snapshot_id TEXT REFERENCES resource_snapshots(snapshot_id) ON DELETE RESTRICT, target_fingerprint TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, terminal_at TEXT); CREATE TABLE IF NOT EXISTS operation_execution_attempts (operation_id TEXT NOT NULL REFERENCES durable_operations(operation_id) ON DELETE RESTRICT, ordinal INTEGER NOT NULL CHECK(ordinal >= 1), state TEXT NOT NULL CHECK(state IN ('executing','known-applied','known-not-applied','failed','cancelled','interrupted')), handoff_started_at TEXT NOT NULL, finished_at TEXT, sanitized_outcome_code TEXT, PRIMARY KEY(operation_id, ordinal)); CREATE TABLE IF NOT EXISTS operation_barriers (barrier_id TEXT PRIMARY KEY, operation_id TEXT NOT NULL UNIQUE REFERENCES durable_operations(operation_id) ON DELETE RESTRICT, scope_kind TEXT NOT NULL CHECK(scope_kind IN ('workspace-mutation','external-target')), scope_fingerprint TEXT NOT NULL, created_at TEXT NOT NULL, removed_at TEXT, removal_reason TEXT); CREATE TABLE IF NOT EXISTS reconciliation_evidence (evidence_id TEXT PRIMARY KEY, operation_id TEXT NOT NULL REFERENCES durable_operations(operation_id) ON DELETE RESTRICT, ordinal INTEGER NOT NULL, classification TEXT NOT NULL CHECK(classification IN ('applied','not-applied','inconclusive')), observed_at TEXT NOT NULL, UNIQUE(operation_id, ordinal)); CREATE TABLE IF NOT EXISTS tool_audit_records (audit_id TEXT PRIMARY KEY, operation_id TEXT NOT NULL REFERENCES durable_operations(operation_id) ON DELETE RESTRICT, ordinal INTEGER NOT NULL, tool_identity TEXT NOT NULL, effect_class TEXT NOT NULL CHECK(effect_class IN ('read','repository-write','ambient')), authority_review_id TEXT REFERENCES authority_reviews(review_id) ON DELETE RESTRICT, decision_code TEXT NOT NULL CHECK(decision_code IN ('allowed','denied')), input_fingerprint TEXT NOT NULL, sanitized_input_json TEXT NOT NULL, sanitized_result_json TEXT, affected_targets_json TEXT NOT NULL, started_at TEXT, terminal_at TEXT, outcome_code TEXT CHECK(outcome_code IN ('applied','not-applied','failed','denied','interrupted','unknown')), UNIQUE(operation_id, ordinal)); CREATE TABLE IF NOT EXISTS tool_audit_corrections (correction_id TEXT PRIMARY KEY, audit_id TEXT NOT NULL REFERENCES tool_audit_records(audit_id) ON DELETE RESTRICT, ordinal INTEGER NOT NULL, reason_code TEXT NOT NULL, sanitized_delta_json TEXT NOT NULL, created_at TEXT NOT NULL, UNIQUE(audit_id, ordinal));");
-    this.db.exec("DROP TRIGGER IF EXISTS tool_audit_immutable_fields; CREATE TRIGGER IF NOT EXISTS tool_audit_no_delete BEFORE DELETE ON tool_audit_records BEGIN SELECT RAISE(ABORT, 'tool-audit-append-only'); END; CREATE TRIGGER IF NOT EXISTS tool_audit_correction_no_update BEFORE UPDATE ON tool_audit_corrections BEGIN SELECT RAISE(ABORT, 'tool-audit-correction-append-only'); END; CREATE TRIGGER IF NOT EXISTS tool_audit_correction_no_delete BEFORE DELETE ON tool_audit_corrections BEGIN SELECT RAISE(ABORT, 'tool-audit-correction-append-only'); END; CREATE TRIGGER IF NOT EXISTS reconciliation_evidence_no_update BEFORE UPDATE ON reconciliation_evidence BEGIN SELECT RAISE(ABORT, 'reconciliation-evidence-append-only'); END; CREATE TRIGGER IF NOT EXISTS reconciliation_evidence_no_delete BEFORE DELETE ON reconciliation_evidence BEGIN SELECT RAISE(ABORT, 'reconciliation-evidence-append-only'); END; CREATE TRIGGER tool_audit_immutable_fields BEFORE UPDATE ON tool_audit_records WHEN OLD.audit_id <> NEW.audit_id OR OLD.operation_id <> NEW.operation_id OR OLD.ordinal <> NEW.ordinal OR OLD.tool_identity <> NEW.tool_identity OR OLD.effect_class <> NEW.effect_class OR OLD.decision_code <> NEW.decision_code OR OLD.input_fingerprint <> NEW.input_fingerprint OR OLD.sanitized_input_json <> NEW.sanitized_input_json OR OLD.authority_review_id IS NOT NEW.authority_review_id OR OLD.outcome_code IS NOT NULL OR (OLD.started_at IS NOT NULL AND NEW.started_at IS NOT OLD.started_at) OR (OLD.terminal_at IS NOT NULL AND NEW.terminal_at IS NOT OLD.terminal_at) OR (OLD.sanitized_result_json IS NOT NULL AND NEW.sanitized_result_json IS NOT OLD.sanitized_result_json) OR (NEW.outcome_code IS NULL AND (NEW.terminal_at IS NOT OLD.terminal_at OR NEW.sanitized_result_json IS NOT OLD.sanitized_result_json)) OR (NEW.outcome_code IS NOT NULL AND NEW.terminal_at IS NULL) BEGIN SELECT RAISE(ABORT, 'tool-audit-immutable'); END;");
+    this.db.exec("DROP TRIGGER IF EXISTS tool_audit_immutable_fields; CREATE TRIGGER IF NOT EXISTS tool_audit_correction_no_update BEFORE UPDATE ON tool_audit_corrections BEGIN SELECT RAISE(ABORT, 'tool-audit-correction-append-only'); END; CREATE TRIGGER IF NOT EXISTS reconciliation_evidence_no_update BEFORE UPDATE ON reconciliation_evidence BEGIN SELECT RAISE(ABORT, 'reconciliation-evidence-append-only'); END; CREATE TRIGGER tool_audit_immutable_fields BEFORE UPDATE ON tool_audit_records WHEN OLD.audit_id <> NEW.audit_id OR OLD.operation_id <> NEW.operation_id OR OLD.ordinal <> NEW.ordinal OR OLD.tool_identity <> NEW.tool_identity OR OLD.effect_class <> NEW.effect_class OR OLD.decision_code <> NEW.decision_code OR OLD.input_fingerprint <> NEW.input_fingerprint OR OLD.sanitized_input_json <> NEW.sanitized_input_json OR OLD.authority_review_id IS NOT NEW.authority_review_id OR OLD.outcome_code IS NOT NULL OR (OLD.started_at IS NOT NULL AND NEW.started_at IS NOT OLD.started_at) OR (OLD.terminal_at IS NOT NULL AND NEW.terminal_at IS NOT OLD.terminal_at) OR (OLD.sanitized_result_json IS NOT NULL AND NEW.sanitized_result_json IS NOT OLD.sanitized_result_json) OR (NEW.outcome_code IS NULL AND (NEW.terminal_at IS NOT OLD.terminal_at OR NEW.sanitized_result_json IS NOT OLD.sanitized_result_json)) OR (NEW.outcome_code IS NOT NULL AND NEW.terminal_at IS NULL) BEGIN SELECT RAISE(ABORT, 'tool-audit-immutable'); END;");
+    this.installAppendOnlyDeletionTriggers();
     this.addColumn("chat_sessions", "title", "TEXT NOT NULL DEFAULT 'New chat'");
     this.addColumn("chat_sessions", "origin_chat_id", "TEXT");
+    this.addColumn("chat_sessions", "fork_origin_deleted", "INTEGER NOT NULL DEFAULT 0");
+    this.db.prepare("UPDATE chat_sessions SET fork_origin_deleted = 1 WHERE origin_chat_id IS NULL AND fork_origin_deleted = 0 AND EXISTS (SELECT 1 FROM projection_events WHERE name = 'chat.fork-created' AND aggregate_id = chat_sessions.chat_id)").run();
     this.addColumn("chat_sessions", "trashed_at", "TEXT");
     this.addColumn("response_attempts", "effective_model_id", "TEXT");
     this.addColumn("response_attempts", "snapshot_id", "TEXT");
     this.addColumn("response_attempts", "ended_at", "TEXT");
     this.db.exec("CREATE UNIQUE INDEX IF NOT EXISTS resource_snapshots_attempt_unique ON resource_snapshots(attempt_id); CREATE UNIQUE INDEX IF NOT EXISTS authority_reviews_open_scope_unique ON authority_reviews(owner_kind, owner_id, logical_scope) WHERE status = 'open'; CREATE INDEX IF NOT EXISTS durable_operations_parent ON durable_operations(parent_kind, parent_id); CREATE INDEX IF NOT EXISTS durable_operations_recovery ON durable_operations(state) WHERE state IN ('executing','reconciling','outcome-unknown')");
+  }
+  private dropAppendOnlyDeletionTriggers(): void {
+    this.db.exec("DROP TRIGGER IF EXISTS tool_audit_no_delete; DROP TRIGGER IF EXISTS tool_audit_correction_no_delete; DROP TRIGGER IF EXISTS reconciliation_evidence_no_delete;");
+  }
+  private installAppendOnlyDeletionTriggers(): void {
+    this.db.exec("CREATE TRIGGER IF NOT EXISTS tool_audit_no_delete BEFORE DELETE ON tool_audit_records BEGIN SELECT RAISE(ABORT, 'tool-audit-append-only'); END; CREATE TRIGGER IF NOT EXISTS tool_audit_correction_no_delete BEFORE DELETE ON tool_audit_corrections BEGIN SELECT RAISE(ABORT, 'tool-audit-correction-append-only'); END; CREATE TRIGGER IF NOT EXISTS reconciliation_evidence_no_delete BEFORE DELETE ON reconciliation_evidence BEGIN SELECT RAISE(ABORT, 'reconciliation-evidence-append-only'); END;");
   }
   private addColumn(table: string, column: string, type: string): void { try { this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`); } catch { /* Existing databases already have the column. */ } }
 }
@@ -551,6 +648,34 @@ function mapToolAudit(row: ToolAuditRow): ToolAuditRecord {
     terminalAt: row.terminalAt,
     outcomeCode: row.outcomeCode,
   };
+}
+
+function isTerminalAttemptState(state: AttemptState): boolean {
+  return state === "succeeded" || state === "blocked" || state === "failed" || state === "cancelled" || state === "interrupted";
+}
+
+function validAttemptTransition(from: AttemptState, to: AttemptState): boolean {
+  if (from === "preparing") return to === "running" || to === "blocked" || to === "failed" || to === "cancelled" || to === "interrupted";
+  if (from === "running") return to === "waiting-for-approval" || to === "succeeded" || to === "failed" || to === "cancelled" || to === "interrupted";
+  if (from === "waiting-for-approval") return to === "running" || to === "cancelled" || to === "interrupted";
+  return false;
+}
+
+function attemptEvent(from: AttemptState, to: AttemptState): string {
+  if (from === "waiting-for-approval" && to === "running") return "response.approval-resolved";
+  if (to === "running") return "response.started";
+  if (to === "waiting-for-approval") return "response.approval-requested";
+  return `response.${to}`;
+}
+
+function ledgerRecord(chatId: string, kind: string, content: string, provenance: string, now: string): LedgerEntry {
+  const cleanKind = kind.trim().slice(0, 64);
+  const cleanContent = content.trim();
+  const cleanProvenance = provenance.trim().slice(0, 512);
+  if (!cleanKind) throw new Error("ledger-kind-empty");
+  if (!cleanContent) throw new Error("ledger-content-empty");
+  if (!cleanProvenance) throw new Error("ledger-provenance-empty");
+  return { entryId: randomUUID(), chatId, kind: cleanKind, content: cleanContent, provenance: cleanProvenance, status: "active", createdAt: now };
 }
 
 function validateHash(value: string, field: string): void {

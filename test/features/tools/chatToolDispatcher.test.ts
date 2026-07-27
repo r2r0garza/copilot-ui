@@ -69,6 +69,52 @@ test("records a denied write without handing an effect to the repository", async
   fixture.store.close();
 });
 
+test("audits model-emitted unknown and over-budget calls as side-effect-free denials", () => {
+  const fixture = workspace(repositoryToolCatalog);
+  const dispatcher = new ChatToolDispatcher({
+    ...fixture.options,
+    requestApproval: async () => "deny",
+  });
+  const unknown = dispatcher.reject("call-unknown", "hallucinated_tool", { password: "never-store" }, "tool-not-in-pinned-workbench-snapshot");
+  const overBudget = dispatcher.reject("call-budget", chatModelToolName("files/write"), { path: "never.txt", content: "never" }, "tool-call-budget-exhausted");
+
+  assert.equal(unknown.error?.code, "tool-not-in-pinned-workbench-snapshot");
+  assert.equal(overBudget.error?.code, "tool-call-budget-exhausted");
+  assert.equal(existsSync(join(fixture.repositoryRoot, "never.txt")), false);
+  const unknownAudit = fixture.store.listToolAudits(unknown.operationId!)[0]!;
+  const budgetAudit = fixture.store.listToolAudits(overBudget.operationId!)[0]!;
+  assert.equal(unknownAudit.toolIdentity, "model/unknown-tool");
+  assert.equal(unknownAudit.decisionCode, "denied");
+  assert.equal((unknownAudit.sanitizedInput.arguments as Readonly<Record<string, unknown>>).password, "[redacted]");
+  assert.equal(budgetAudit.toolIdentity, "files/write");
+  assert.equal(budgetAudit.decisionCode, "denied");
+  fixture.store.close();
+});
+
+test("keeps Chat read-only and interactive while a Task owns the Repository Write Lock", async () => {
+  const fixture = workspace(repositoryToolCatalog);
+  writeFileSync(join(fixture.repositoryRoot, "README.md"), "read while locked\n");
+  assert.equal(fixture.store.acquireRepositoryWriteLock("task-42"), true);
+  let approvals = 0;
+  const dispatcher = new ChatToolDispatcher({
+    ...fixture.options,
+    requestApproval: async () => { approvals += 1; return "once"; },
+  });
+
+  const read = await dispatcher.invoke("call-locked-read", "files/read", { path: "README.md" });
+  const write = await dispatcher.invoke("call-locked-write", "files/write", { path: "blocked.txt", mode: "create", content: "blocked" });
+
+  assert.equal(read.ok, true);
+  assert.equal(write.ok, false);
+  assert.equal(write.error?.code, "repository-write-lock-held");
+  assert.equal(approvals, 0);
+  assert.equal(existsSync(join(fixture.repositoryRoot, "blocked.txt")), false);
+  assert.equal(fixture.store.repositoryWriteLockHolder(), "task-42");
+  assert.equal(fixture.store.listToolAudits(write.operationId!)[0]?.decisionCode, "denied");
+  fixture.store.releaseRepositoryWriteLock("task-42");
+  fixture.store.close();
+});
+
 test("uses a one-shot grant, write lock, and durable outcome for an approved write", async () => {
   const fixture = workspace(repositoryToolCatalog);
   const dispatcher = new ChatToolDispatcher({

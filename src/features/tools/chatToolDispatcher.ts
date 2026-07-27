@@ -201,6 +201,33 @@ export class ChatToolDispatcher {
     }
   }
 
+  /** Records model-emitted calls that cannot enter the pinned executable Tool set. */
+  public reject(callId: string, reportedName: string, rawInput: unknown, code: "tool-not-in-pinned-workbench-snapshot" | "tool-call-budget-exhausted"): ChatToolInvocationResult {
+    const resolvedIdentity = resolveChatModelToolIdentity(this.options.snapshot, reportedName);
+    const tool = resolvedIdentity ? chatModelTools(this.options.snapshot).find((candidate) => candidate.identity === resolvedIdentity) : undefined;
+    const toolIdentity = tool?.identity ?? "model/unknown-tool";
+    const operation = this.options.store.recordToolIntent({
+      operationKey: fingerprint({ attemptId: this.options.attemptId, callId, reportedName, code }),
+      parentKind: "response-attempt",
+      parentId: this.options.attemptId,
+      effectClass: tool?.effectClass ?? "ambient",
+      authorityGrantId: null,
+      authorityReviewId: null,
+      resourceSnapshotId: this.options.snapshot.snapshotId,
+      targetFingerprint: fingerprint({ reportedName, snapshotId: this.options.snapshot.snapshotId }),
+      toolIdentity,
+      decisionCode: "denied",
+      input: {
+        callId,
+        reportedName,
+        arguments: isRecord(rawInput) ? rawInput : { invalidInputType: typeof rawInput },
+        policyReason: code,
+      },
+      affectedTargets: ["resource:model-tool"],
+    });
+    return { ok: false, operationId: operation.operationId, error: { code } };
+  }
+
   private execute(identity: string, input: Readonly<Record<string, unknown>>): Readonly<Record<string, unknown>> {
     if (identity.startsWith("files/")) return this.repository.invoke(identity, input) as unknown as Readonly<Record<string, unknown>>;
     this.git ??= new SafeGitExecutor(this.options.repositoryRoot);

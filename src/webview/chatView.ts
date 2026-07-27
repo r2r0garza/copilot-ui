@@ -1,4 +1,5 @@
 import type { AgentResource, ResourceStatus } from "../features/resources";
+import type { AttemptState } from "../adapters/sqlite/workspaceStore";
 import { renderAssistantMarkdown } from "./markdown";
 
 export interface ChatViewState {
@@ -8,10 +9,16 @@ export interface ChatViewState {
     readonly agentIdentity: string;
     readonly trashed: boolean;
     readonly forked: boolean;
+    readonly forkOriginDeleted?: boolean;
   }[];
   readonly selectedChatId: string | undefined;
   readonly showingTrash: boolean;
-  readonly messages: readonly { readonly role: "user" | "assistant"; readonly content: string }[];
+  readonly messages: readonly { readonly role: "user" | "assistant"; readonly content: string; readonly attemptState?: AttemptState }[];
+  readonly activeAttemptId?: string;
+  readonly retryAttemptId?: string;
+  readonly summary?: { readonly content: string; readonly provenance: string; readonly version: number };
+  readonly ledger: readonly { readonly entryId: string; readonly kind: string; readonly content: string; readonly provenance: string; readonly status: "active" | "superseded" | "disputed" }[];
+  readonly repositoryWriteLockHolder?: string;
   readonly activeAgentIdentity: string;
   readonly agents: readonly AgentResource[];
   readonly catalogRevision: number;
@@ -20,7 +27,7 @@ export interface ChatViewState {
 
 export function renderChatsView(state: ChatViewState): string {
   const activeAgent = agentForIdentity(state.agents, state.activeAgentIdentity);
-  const canSend = !state.showingTrash && activeAgent.status === "available";
+  const canSend = !state.showingTrash && activeAgent.status === "available" && !state.activeAttemptId;
 
   return `<section id="chats" class="view chat-view" data-active="false">
     <div class="chat-masthead">
@@ -52,8 +59,8 @@ export function renderChatsView(state: ChatViewState): string {
       </div>
       <div class="context-cell">
         <span class="context-label">Session contract</span>
-        <strong class="context-value">${state.selectedChatId ? "Agent pinned" : "Ready"}</strong>
-        <span class="context-detail">Changing Agent starts a new Chat</span>
+        <strong class="context-value">${state.repositoryWriteLockHolder ? "Repository read-only" : state.selectedChatId ? "Agent pinned" : "Ready"}</strong>
+        <span class="context-detail">${state.repositoryWriteLockHolder ? `Write lock held by ${escapeHtml(state.repositoryWriteLockHolder)}` : "Changing Agent starts a new Chat"}</span>
       </div>
     </div>
     <div class="chat-shell">
@@ -73,7 +80,8 @@ export function renderChatsView(state: ChatViewState): string {
           <div id="chat-toolbar" class="chat-toolbar">${renderToolbar(state)}</div>
         </header>
         <div id="transcript" class="transcript">${renderMessages(state.messages, activeAgent.identity)}</div>
-        <p id="chat-error" class="chat-error" role="status">${canSend ? "" : escapeHtml(activeAgent.reason ?? "This Agent is not available for new responses.")}</p>
+        ${renderSessionContext(state)}
+        <p id="chat-error" class="chat-error" role="status">${canSend ? "" : escapeHtml(state.activeAttemptId ? "A response is in progress for this Chat." : activeAgent.reason ?? "This Agent is not available for new responses.")}</p>
         <form id="chat-form" class="composer">
           <div class="composer-field">
             <textarea id="chat-input" aria-label="Chat message" aria-multiline="true" rows="1" placeholder="Message ${escapeHtml(activeAgent.identity)}…" ${canSend ? "" : "disabled"}></textarea>
@@ -98,7 +106,7 @@ function renderAgentOptions(agents: readonly AgentResource[], selectedIdentity: 
 function renderSessions(state: ChatViewState): string {
   return state.chats.map((chat) => `<button class="session-item" data-chat-action="select" data-chat-id="${escapeHtml(chat.chatId)}" aria-current="${String(chat.chatId === state.selectedChatId)}">
     <span class="session-copy"><strong>${escapeHtml(chat.label)}</strong><small>${escapeHtml(chat.agentIdentity)}</small></span>
-    ${chat.forked ? "<span class=\"session-tag\">Fork</span>" : ""}
+    ${chat.forkOriginDeleted ? "<span class=\"session-tag\">Origin deleted</span>" : chat.forked ? "<span class=\"session-tag\">Fork</span>" : ""}
   </button>`).join("") || `<div class="session-empty"><span aria-hidden="true">◎</span><p>${state.showingTrash ? "Trash is empty." : "No conversations yet."}</p></div>`;
 }
 
@@ -106,18 +114,35 @@ function renderToolbar(state: ChatViewState): string {
   if (!state.selectedChatId) return "<span class=\"muted\">A new session will be created on send.</span>";
   return state.showingTrash
     ? `<button data-chat-action="restore" class="quiet-action" type="button">Restore</button><button data-chat-action="delete" class="danger-action" type="button">Delete permanently</button>`
-    : `<button data-chat-action="rename" class="quiet-action" type="button">Rename</button><button data-chat-action="fork" class="quiet-action" type="button">Fork</button><button data-chat-action="trash" class="quiet-action" type="button">Move to Trash</button>`;
+    : `${state.activeAttemptId ? `<button data-chat-action="cancel-attempt" class="danger-action" type="button">Cancel response</button>` : ""}${state.retryAttemptId ? `<button data-chat-action="retry-attempt" data-attempt-id="${escapeHtml(state.retryAttemptId)}" class="send" type="button">Retry</button>` : ""}<button data-chat-action="rename" class="quiet-action" type="button">Rename</button><button data-chat-action="fork" class="quiet-action" type="button">Fork</button><button data-chat-action="trash" class="quiet-action" type="button">Move to Trash</button>`;
 }
 
 function renderMessages(messages: ChatViewState["messages"], agentIdentity: string): string {
   return messages.map((item) => `<article class="message markdown ${item.role}">
-    <header><span>${item.role === "user" ? "YOU" : escapeHtml(agentIdentity)}</span></header>
+    <header><span>${item.role === "user" ? "YOU" : escapeHtml(agentIdentity)}</span>${item.attemptState && item.attemptState !== "succeeded" ? `<span class="attempt-state">${escapeHtml(item.attemptState)}</span>` : ""}</header>
     <div>${renderAssistantMarkdown(item.content)}</div>
   </article>`).join("") || `<div class="transcript-empty">
     <span class="empty-glyph" aria-hidden="true">⌁</span>
     <h2>Open a line to ${escapeHtml(agentIdentity)}</h2>
     <p>The Agent’s repository instructions and this catalog revision will be pinned when the response begins.</p>
   </div>`;
+}
+
+function renderSessionContext(state: ChatViewState): string {
+  if (!state.selectedChatId || state.showingTrash) return "";
+  const summary = state.summary
+    ? `<div class="context-record"><header><strong>Summary v${state.summary.version}</strong><small>${escapeHtml(state.summary.provenance)}</small></header><p>${escapeHtml(state.summary.content)}</p></div>`
+    : `<p class="context-empty">No summary yet. Generate one explicitly when you want a compact, versioned view of this conversation.</p>`;
+  const activeLedger = state.ledger.filter((entry) => entry.status === "active");
+  const ledger = activeLedger.map((entry) => `<div class="context-record ledger-record"><header><strong>${escapeHtml(entry.kind)}</strong><small>${escapeHtml(entry.provenance)}</small></header><p>${escapeHtml(entry.content)}</p><button data-chat-action="correct-ledger-open" data-entry-id="${escapeHtml(entry.entryId)}" data-entry-content="${escapeHtml(entry.content)}" class="text-action" type="button">Correct</button></div>`).join("")
+    || `<p class="context-empty">No Session Ledger entries yet.</p>`;
+  return `<details class="session-context">
+    <summary><span>Session context</span><span>${state.summary ? "1 summary" : "No summary"} · ${activeLedger.length} Ledger ${activeLedger.length === 1 ? "entry" : "entries"}</span></summary>
+    <div class="session-context-grid">
+      <section><header class="context-section-heading"><div><p class="eyebrow">Versioned</p><h3>Conversation Summary</h3></div><button data-chat-action="generate-summary" class="quiet-action" type="button" ${state.activeAttemptId || state.messages.length === 0 ? "disabled" : ""}>${state.summary ? "Regenerate" : "Generate"}</button></header>${summary}</section>
+      <section id="ledger-section"><header class="context-section-heading"><div><p class="eyebrow">Inspectable</p><h3>Session Ledger</h3></div><button data-chat-action="add-ledger-open" class="quiet-action" type="button">Add note</button></header><div id="ledger-editor-slot"></div>${ledger}</section>
+    </div>
+  </details>`;
 }
 
 function agentForIdentity(agents: readonly AgentResource[], identity: string): AgentResource {
