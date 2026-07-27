@@ -1,4 +1,5 @@
 import type { AgentResource, ResourceStatus } from "../features/resources";
+import { renderAssistantMarkdown } from "./markdown";
 
 export interface ChatViewState {
   readonly chats: readonly {
@@ -109,9 +110,9 @@ function renderToolbar(state: ChatViewState): string {
 }
 
 function renderMessages(messages: ChatViewState["messages"], agentIdentity: string): string {
-  return messages.map((item) => `<article class="message ${item.role}">
+  return messages.map((item) => `<article class="message markdown ${item.role}">
     <header><span>${item.role === "user" ? "YOU" : escapeHtml(agentIdentity)}</span></header>
-    <div>${escapeHtml(item.content)}</div>
+    <div>${renderAssistantMarkdown(item.content)}</div>
   </article>`).join("") || `<div class="transcript-empty">
     <span class="empty-glyph" aria-hidden="true">⌁</span>
     <h2>Open a line to ${escapeHtml(agentIdentity)}</h2>

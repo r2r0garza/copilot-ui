@@ -233,6 +233,16 @@ export class WorkspaceStore {
     });
     return evidence;
   }
+  /** Closes a proven-not-applied attempt without replay so a future request must obtain fresh authority. */
+  public abandonOperationRetry(operationId: string, now = new Date().toISOString()): void {
+    this.transaction(() => {
+      const changed = this.db.prepare("UPDATE durable_operations SET version = version + 1, state = 'cancelled', updated_at = ?, terminal_at = ? WHERE operation_id = ? AND state = 'retry-wait'").run(now, now, operationId);
+      if (changed.changes !== 1) throw new Error("operation-not-awaiting-retry");
+      this.db.prepare("UPDATE operation_barriers SET removed_at = ?, removal_reason = 'not-applied-retry-abandoned' WHERE operation_id = ? AND removed_at IS NULL").run(now, operationId);
+      this.appendAuditCorrection(operationId, "not-applied-retry-abandoned", { replayed: false }, now);
+      this.appendEvent("operation.retry-abandoned", operationId, JSON.stringify({ replayed: false }), now);
+    });
+  }
   public pinResourceSnapshot(attemptId: string, snapshotId: string, content: string, now = new Date().toISOString()): ResourceSnapshotRecord {
     if (!/^[a-f0-9]{64}$/.test(snapshotId)) throw new Error("resource-snapshot-id-invalid");
     let parsed: unknown;
@@ -349,6 +359,9 @@ export class WorkspaceStore {
   public getDurableOperationByKey(operationKey: string): DurableOperation | undefined {
     return this.db.prepare("SELECT operation_id AS operationId, version, operation_key AS operationKey, parent_kind AS parentKind, parent_id AS parentId, state, effect_class AS effectClass, intent_fingerprint AS intentFingerprint, authority_grant_id AS authorityGrantId, resource_snapshot_id AS resourceSnapshotId, target_fingerprint AS targetFingerprint, created_at AS createdAt, updated_at AS updatedAt, terminal_at AS terminalAt FROM durable_operations WHERE operation_key = ?").get(operationKey) as DurableOperation | undefined;
   }
+  public listOperationsAwaitingReconciliation(): readonly DurableOperation[] {
+    return this.db.prepare("SELECT operation_id AS operationId, version, operation_key AS operationKey, parent_kind AS parentKind, parent_id AS parentId, state, effect_class AS effectClass, intent_fingerprint AS intentFingerprint, authority_grant_id AS authorityGrantId, resource_snapshot_id AS resourceSnapshotId, target_fingerprint AS targetFingerprint, created_at AS createdAt, updated_at AS updatedAt, terminal_at AS terminalAt FROM durable_operations WHERE state = 'outcome-unknown' ORDER BY created_at").all() as DurableOperation[];
+  }
   public listToolAudits(operationId: string): readonly ToolAuditRecord[] {
     const rows = this.db.prepare("SELECT audit_id AS auditId, operation_id AS operationId, ordinal, tool_identity AS toolIdentity, effect_class AS effectClass, authority_review_id AS authorityReviewId, decision_code AS decisionCode, input_fingerprint AS inputFingerprint, sanitized_input_json AS sanitizedInputJson, sanitized_result_json AS sanitizedResultJson, affected_targets_json AS affectedTargetsJson, started_at AS startedAt, terminal_at AS terminalAt, outcome_code AS outcomeCode FROM tool_audit_records WHERE operation_id = ? ORDER BY ordinal").all(operationId) as ToolAuditRow[];
     return rows.map(mapToolAudit);
@@ -372,6 +385,9 @@ export class WorkspaceStore {
   }
   public operationHasActiveBarrier(operationId: string): boolean {
     return Boolean(this.db.prepare("SELECT 1 FROM operation_barriers WHERE operation_id = ? AND removed_at IS NULL").get(operationId));
+  }
+  public workspaceMutationBlocked(): boolean {
+    return Boolean(this.db.prepare("SELECT 1 FROM operation_barriers WHERE scope_kind = 'workspace-mutation' AND removed_at IS NULL").get());
   }
   public listEvents(): readonly EventRecord[] { return this.db.prepare("SELECT sequence, name, aggregate_id as aggregateId, payload, emitted_at as emittedAt FROM projection_events ORDER BY sequence").all() as EventRecord[]; }
   public close(): void { this.db.close(); }
@@ -397,7 +413,10 @@ export class WorkspaceStore {
   private interruptAbandonedOperations(): void {
     const now = new Date().toISOString();
     const operations = this.db.prepare("SELECT operation_id AS operationId FROM durable_operations WHERE state = 'executing'").all() as { operationId: string }[];
-    for (const operation of operations) this.markToolOutcomeUnknown(operation.operationId, now);
+    for (const operation of operations) {
+      this.markToolOutcomeUnknown(operation.operationId, now);
+      this.releaseRepositoryWriteLock(operation.operationId, now);
+    }
   }
   private interruptAbandonedAttempts(): void { const now = new Date().toISOString(); this.transaction(() => { const attempts = this.db.prepare("SELECT attempt_id as attemptId FROM response_attempts WHERE state IN ('preparing','running','waiting-for-approval')").all() as { attemptId: string }[]; for (const attempt of attempts) { this.db.prepare("UPDATE response_attempts SET state = 'interrupted', ended_at = ? WHERE attempt_id = ?").run(now, attempt.attemptId); this.appendEvent("response.interrupted", attempt.attemptId, JSON.stringify({ reason: "extension-host-restart" }), now); } }); }
   private migrate(): void {

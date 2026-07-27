@@ -2,9 +2,18 @@ import * as vscode from "vscode";
 
 import { WorkspaceStore } from "../adapters/sqlite/workspaceStore";
 import { bundledOrchestrator, listChatAgents, resolveAvailableChatAgent, selectAvailableModel } from "../features/chats";
-import type { EffectiveModelSnapshot, ResourceCatalogState } from "../features/resources";
+import type { EffectiveModelSnapshot, ResourceCatalogState, ResourceSnapshot } from "../features/resources";
+import {
+  ChatToolDispatcher,
+  chatModelToolName,
+  chatModelTools,
+  reconcileWorkspaceOperations,
+  resolveChatModelToolIdentity,
+  type ChatToolApproval,
+} from "../features/tools";
 import type { Runtime } from "../runtime/createRuntime";
 import { renderChatsView, type ChatViewState } from "./chatView";
+import { renderAssistantMarkdown } from "./markdown";
 import { renderResourceCatalog } from "./resourceView";
 
 const VIEW_TYPE = "bridgit.workbench";
@@ -21,7 +30,31 @@ export function createWorkbenchPanel(
   );
 
   let store: WorkspaceStore | undefined;
-  const getStore = (): WorkspaceStore => store ??= new WorkspaceStore((context.storageUri ?? context.globalStorageUri).fsPath);
+  const getStore = (): WorkspaceStore => {
+    if (store) return store;
+    store = new WorkspaceStore((context.storageUri ?? context.globalStorageUri).fsPath);
+    const repositoryRoot = _runtime.resources.getState().workspaceRoot;
+    if (repositoryRoot) {
+      const recovered = reconcileWorkspaceOperations(store, repositoryRoot);
+      const applied = recovered.filter(({ classification }) => classification === "applied").length;
+      const notApplied = recovered.filter(({ classification }) => classification === "not-applied").length;
+      const inconclusive = recovered.filter(({ classification }) => classification === "inconclusive").length;
+      if (notApplied > 0) {
+        void vscode.window.showInformationMessage(
+          `Bridgit recovered ${operationCount(notApplied)}: no repository change was applied, and the operation was not retried.`,
+        );
+      }
+      if (applied > 0) {
+        void vscode.window.showInformationMessage(
+          `Bridgit recovered ${operationCount(applied)} and confirmed the repository change was already applied. It was not replayed.`,
+        );
+      }
+      if (inconclusive > 0) {
+        void vscode.window.showWarningMessage("Bridgit blocked repository mutations because an interrupted Tool call could not be reconciled.");
+      }
+    }
+    return store;
+  };
   let selectedChatId: string | undefined;
   let showingTrash = false;
   let resourceState = _runtime.resources.getState();
@@ -109,6 +142,7 @@ export function createWorkbenchPanel(
       selectedChatId = targetChat.chatId;
       if (!resolveAvailableChatAgent(resourceState, targetChat.agentIdentity)) throw new Error("This Chat’s Agent is no longer available. Select an available Agent to start a new Chat.");
       const turn = authority.submitTurn(targetChat.chatId, content);
+      await panel.webview.postMessage({ type: "chat-user-markdown", html: renderAssistantMarkdown(content) });
       const models = await vscode.lm.selectChatModels();
       const agent = resolveAvailableChatAgent(resourceState, targetChat.agentIdentity);
       if (!agent) {
@@ -135,12 +169,45 @@ export function createWorkbenchPanel(
       if (targetChat.title === "New chat") {
         authority.setChatTitle(targetChat.chatId, await generateChatTitle(model, content, cancellation.token));
       }
-      const response = await model.sendRequest([
-        vscode.LanguageModelChatMessage.User(`Follow these repository Agent instructions for this response:\n\n${resourceSnapshot.agent.instructions}`),
-        vscode.LanguageModelChatMessage.User(content),
-      ], {}, cancellation.token);
-      let output = "";
-      for await (const fragment of response.text) { output += fragment; authority.checkpointOutput(turn.turnId, output); await panel.webview.postMessage({ type: "chat-stream", content: output }); }
+      const repositoryRoot = resourceState.workspaceRoot;
+      if (!repositoryRoot) throw new Error("Open a repository folder before using Chat.");
+      const dispatcher = new ChatToolDispatcher({
+        store: authority,
+        repositoryRoot,
+        chatId: targetChat.chatId,
+        attemptId: attempt.attemptId,
+        snapshot: resourceSnapshot,
+        requestApproval: async ({ tool, affectedTargets, riskSummary }) => {
+          authority.transitionAttempt(attempt.attemptId, "waiting-for-approval");
+          await sendState();
+          const detail = [
+            riskSummary,
+            affectedTargets.length ? `Targets: ${affectedTargets.join(", ")}` : "Target: active repository",
+            "The exact Tool, scope, snapshot, decision, and outcome will be recorded locally.",
+          ].join("\n\n");
+          const choice = await vscode.window.showWarningMessage(
+            `${resourceSnapshot.agentIdentity} wants to run ${tool.identity}.`,
+            { modal: true, detail },
+            "Allow once",
+            "Allow for this Chat",
+            "Deny",
+          );
+          authority.transitionAttempt(attempt.attemptId, "running");
+          await sendState();
+          return approvalFromChoice(choice);
+        },
+      });
+      const output = await runChatModelWithTools(
+        model,
+        resourceSnapshot,
+        content,
+        dispatcher,
+        cancellation.token,
+        async (visible) => {
+          authority.checkpointOutput(turn.turnId, visible);
+          await panel.webview.postMessage({ type: "chat-stream", html: renderAssistantMarkdown(visible) });
+        },
+      );
       authority.appendOutput(turn.turnId, output || "The model returned no visible text.");
       authority.transitionAttempt(attempt.attemptId, "succeeded");
       await sendState();
@@ -247,6 +314,17 @@ function renderWorkbench(webview: vscode.Webview, state: ChatViewState, resource
       .message > div { padding: 9px 11px 10px; white-space: pre-wrap; line-height: 1.5; }
       .message.user { align-self: flex-end; border-left: 1px solid var(--vscode-panel-border); border-right: 2px solid var(--vscode-focusBorder); background: var(--vscode-input-background); }
       .message.assistant { align-self: flex-start; }
+      .message.markdown > div { white-space: normal; }
+      .message.markdown p { margin: 0 0 9px; }
+      .message.markdown p:last-child { margin-bottom: 0; }
+      .message.markdown ul, .message.markdown ol { margin: 7px 0; padding-left: 22px; }
+      .message.markdown blockquote { margin: 8px 0; padding-left: 10px; color: var(--vscode-descriptionForeground); border-left: 2px solid var(--vscode-textBlockQuote-border); }
+      .message.markdown code { padding: 1px 4px; border-radius: 2px; background: var(--vscode-textCodeBlock-background); font-family: var(--vscode-editor-font-family); font-size: .92em; }
+      .message.markdown pre { max-width: 100%; margin: 8px 0; padding: 9px 10px; overflow-x: auto; background: var(--vscode-textCodeBlock-background); }
+      .message.markdown pre code { padding: 0; background: transparent; }
+      .message.markdown a { color: var(--vscode-textLink-foreground); }
+      .message.markdown h1, .message.markdown h2, .message.markdown h3 { margin: 12px 0 7px; font-size: 1em; }
+      .markdown-image-placeholder { color: var(--vscode-descriptionForeground); font-style: italic; }
       .transcript-empty { width: min(460px, 90%); margin: auto; text-align: center; }
       .empty-glyph { display: block; margin-bottom: 13px; color: var(--vscode-focusBorder); font-size: 29px; }
       .transcript-empty h2 { margin: 0 0 8px; font-size: 16px; font-weight: 600; }
@@ -354,7 +432,7 @@ function renderWorkbench(webview: vscode.Webview, state: ChatViewState, resource
       const resizeComposer = (input) => { input.style.height = 'auto'; input.style.height = Math.min(input.scrollHeight, 180) + 'px'; input.style.overflowY = input.scrollHeight > 180 ? 'auto' : 'hidden'; };
       document.addEventListener('input', (event) => { if (event.target instanceof HTMLTextAreaElement && event.target.id === 'chat-input') resizeComposer(event.target); });
       document.addEventListener('keydown', (event) => { if (event.key === 'Enter' && !event.shiftKey && event.target instanceof HTMLTextAreaElement && event.target.id === 'chat-input') { event.preventDefault(); event.target.form?.requestSubmit(); } });
-      document.addEventListener('submit', (event) => { if (!(event.target instanceof HTMLFormElement) || event.target.id !== 'chat-form') return; event.preventDefault(); const input = document.querySelector('#chat-input'); const element = transcript(); const error = chatError(); const agent = document.querySelector('.conversation-identity strong')?.textContent || 'Agent'; if (input instanceof HTMLTextAreaElement && input.value.trim() && element) { const content = input.value; element.querySelector('.transcript-empty')?.remove(); element.innerHTML += '<article class="message user"><header><span>YOU</span></header><div>' + escapeHtml(content) + '</div></article><article id="streaming-response" class="message assistant"><header><span>' + escapeHtml(agent) + '</span></header><div></div></article>'; scrollToLatest(); if (error) error.textContent = 'Sending…'; vscode.postMessage({ type: 'chat-send', content }); input.value = ''; resizeComposer(input); } });
+      document.addEventListener('submit', (event) => { if (!(event.target instanceof HTMLFormElement) || event.target.id !== 'chat-form') return; event.preventDefault(); const input = document.querySelector('#chat-input'); const element = transcript(); const error = chatError(); const agent = document.querySelector('.conversation-identity strong')?.textContent || 'Agent'; if (input instanceof HTMLTextAreaElement && input.value.trim() && element) { const content = input.value; element.querySelector('.transcript-empty')?.remove(); element.innerHTML += '<article id="pending-user-message" class="message markdown user"><header><span>YOU</span></header><div>' + escapeHtml(content) + '</div></article><article id="streaming-response" class="message markdown assistant"><header><span>' + escapeHtml(agent) + '</span></header><div></div></article>'; scrollToLatest(); if (error) error.textContent = 'Sending…'; vscode.postMessage({ type: 'chat-send', content }); input.value = ''; resizeComposer(input); } });
       document.addEventListener('change', (event) => { if (event.target instanceof HTMLSelectElement && event.target.id === 'chat-agent-select') vscode.postMessage({ type: 'chat-agent-select', agentIdentity: event.target.value }); });
       const saveRename = () => { const title = document.querySelector('#rename-input')?.value || ''; vscode.postMessage({ type: 'chat-action', action: 'rename', title }); };
       document.addEventListener('click', (event) => { if (event.target instanceof Element && event.target.closest('#resource-refresh')) vscode.postMessage({ type: 'resource-refresh' }); });
@@ -362,7 +440,7 @@ function renderWorkbench(webview: vscode.Webview, state: ChatViewState, resource
       document.addEventListener('keydown', (event) => { if (event.key === 'Enter' && event.target instanceof HTMLInputElement && event.target.id === 'rename-input') { event.preventDefault(); saveRename(); } });
       const replaceView = (id, html) => { const current = document.querySelector('#' + id); if (!current) return; const active = current.dataset.active; const template = document.createElement('template'); template.innerHTML = html; const next = template.content.firstElementChild; if (next) { next.dataset.active = active; current.replaceWith(next); } };
       const refreshChatResources = (html) => { const prior = document.querySelector('#chat-input'); const draft = prior instanceof HTMLTextAreaElement ? prior.value : ''; const focused = prior === document.activeElement; replaceView('chats', html); const next = document.querySelector('#chat-input'); if (next instanceof HTMLTextAreaElement && !next.disabled) { next.value = draft; resizeComposer(next); if (focused) next.focus(); } };
-      window.addEventListener('message', (event) => { const message = event.data; if (message.type === 'chat-state') { replaceView('chats', message.html); scrollToLatest(); } if (message.type === 'chat-resource-state') refreshChatResources(message.html); if (message.type === 'chat-stream') { const stream = document.querySelector('#streaming-response > div'); if (stream) { stream.textContent = message.content; scrollToLatest(); } } if (message.type === 'chat-error') { const error = chatError(); if (error) error.textContent = message.message; } if (message.type === 'resource-state') replaceView('agents', message.html); });
+      window.addEventListener('message', (event) => { const message = event.data; if (message.type === 'chat-state') { replaceView('chats', message.html); scrollToLatest(); } if (message.type === 'chat-resource-state') refreshChatResources(message.html); if (message.type === 'chat-user-markdown') { const pending = document.querySelector('#pending-user-message > div'); if (pending) { pending.innerHTML = message.html; pending.parentElement?.removeAttribute('id'); scrollToLatest(); } } if (message.type === 'chat-stream') { const stream = document.querySelector('#streaming-response > div'); if (stream) { stream.innerHTML = message.html; scrollToLatest(); } } if (message.type === 'chat-error') { const error = chatError(); if (error) error.textContent = message.message; } if (message.type === 'resource-state') replaceView('agents', message.html); });
     </script>
   </body>
 </html>`;
@@ -402,6 +480,86 @@ function chatState(
     workspaceName: resources.workspaceName,
   };
 }
+
+async function runChatModelWithTools(
+  model: vscode.LanguageModelChat,
+  snapshot: ResourceSnapshot,
+  userContent: string,
+  dispatcher: ChatToolDispatcher,
+  token: vscode.CancellationToken,
+  checkpoint: (visible: string) => Promise<void>,
+): Promise<string> {
+  const messages: vscode.LanguageModelChatMessage[] = [
+    vscode.LanguageModelChatMessage.User(`Follow these repository Agent instructions for this response:\n\n${snapshot.agent.instructions}`),
+    vscode.LanguageModelChatMessage.User(userContent),
+  ];
+  const tools = chatModelTools(snapshot).map((tool): vscode.LanguageModelChatTool => ({
+    name: chatModelToolName(tool.identity),
+    description: `${tool.description} Bridgit identity: ${tool.identity}.`,
+    inputSchema: tool.inputSchema,
+  }));
+  let visible = "";
+  let invocationCount = 0;
+  const maxRounds = 8;
+  const maxInvocations = 16;
+
+  for (let round = 0; round < maxRounds; round += 1) {
+    const response = await model.sendRequest(messages, {
+      tools,
+      toolMode: vscode.LanguageModelChatToolMode.Auto,
+    }, token);
+    const assistantParts: Array<vscode.LanguageModelTextPart | vscode.LanguageModelToolCallPart> = [];
+    const calls: vscode.LanguageModelToolCallPart[] = [];
+    for await (const part of response.stream) {
+      if (part instanceof vscode.LanguageModelTextPart) {
+        assistantParts.push(part);
+        visible += part.value;
+        await checkpoint(visible);
+      } else if (part instanceof vscode.LanguageModelToolCallPart) {
+        assistantParts.push(part);
+        calls.push(part);
+      }
+    }
+    if (calls.length === 0) return visible;
+    messages.push(vscode.LanguageModelChatMessage.Assistant(assistantParts));
+    const results: vscode.LanguageModelToolResultPart[] = [];
+    for (const call of calls) {
+      invocationCount += 1;
+      const identity = resolveChatModelToolIdentity(snapshot, call.name);
+      const result = invocationCount <= maxInvocations
+        ? identity
+          ? await dispatcher.invoke(call.callId, identity, call.input)
+          : { ok: false, error: { code: "tool-not-in-pinned-workbench-snapshot" } }
+        : { ok: false, error: { code: "tool-call-budget-exhausted" } };
+      results.push(new vscode.LanguageModelToolResultPart(call.callId, [
+        new vscode.LanguageModelTextPart(JSON.stringify(result)),
+      ]));
+    }
+    messages.push(vscode.LanguageModelChatMessage.User(results));
+    if (invocationCount >= maxInvocations) {
+      const notice = "\n\nBridgit stopped after the bounded Tool-call limit was reached.";
+      visible += notice;
+      await checkpoint(visible);
+      return visible;
+    }
+  }
+
+  const notice = "\n\nBridgit stopped after the bounded Tool-call round limit was reached.";
+  visible += notice;
+  await checkpoint(visible);
+  return visible;
+}
+
+function approvalFromChoice(choice: string | undefined): ChatToolApproval {
+  if (choice === "Allow once") return "once";
+  if (choice === "Allow for this Chat") return "session";
+  return "deny";
+}
+
+function operationCount(count: number): string {
+  return `${count} interrupted Tool operation${count === 1 ? "" : "s"}`;
+}
+
 function modelSnapshot(model: vscode.LanguageModelChat, selectionSource: EffectiveModelSnapshot["selectionSource"]): EffectiveModelSnapshot {
   return {
     id: model.id,

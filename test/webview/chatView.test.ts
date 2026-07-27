@@ -56,3 +56,30 @@ test("Chat view escapes durable titles and message content", () => {
   assert.match(html, /&lt;script&gt;/);
   assert.match(html, /&lt;img src=x&gt;/);
 });
+
+test("Chat view renders safe assistant Markdown without enabling model-authored HTML", () => {
+  const html = renderChatsView(state({
+    messages: [{
+      role: "assistant",
+      content: "The package is **test-name-frontend**.\n\n- one\n- `two`\n\n<script>alert(1)</script>\n\n[unsafe](javascript:alert(1))",
+    }],
+  }));
+  assert.match(html, /<strong>test-name-frontend<\/strong>/);
+  assert.match(html, /<ul>/);
+  assert.match(html, /<code>two<\/code>/);
+  assert.doesNotMatch(html, /<script>/);
+  assert.match(html, /&lt;script&gt;/);
+  assert.doesNotMatch(html, /href="javascript:/);
+});
+
+test("Chat view renders pasted user Markdown and code through the same safe boundary", () => {
+  const html = renderChatsView(state({
+    messages: [{
+      role: "user",
+      content: "Please review **this**:\n\n```ts\nconst answer = 42;\n```",
+    }],
+  }));
+  assert.match(html, /<strong>this<\/strong>/);
+  assert.match(html, /class="language-ts"/);
+  assert.match(html, /const answer = 42;/);
+});
