@@ -44,4 +44,22 @@ export function authorize(request: ToolRequest, grant: AuthorityGrant | undefine
 
 export function audit(request: ToolRequest, decision: PolicyDecision, snapshotId: string, now = new Date().toISOString()): ToolAudit { return { auditId: randomUUID(), operationKey: request.operationKey, tool: request.tool, decision, snapshotId, createdAt: now }; }
 export function operationKey(request: Omit<ToolRequest, "operationKey">): string { return createHash("sha256").update(JSON.stringify({ tool: request.tool, effect: request.effect, input: sanitize(request.input), paths: request.paths })).digest("hex"); }
-export function sanitize(input: Record<string, unknown>): Record<string, unknown> { return Object.fromEntries(Object.entries(input).map(([key, value]) => /secret|token|password|authorization|credential/i.test(key) ? [key, "[redacted]"] : [key, value])); }
+export function sanitize(input: Record<string, unknown>): Record<string, unknown> {
+  return sanitizeValue(input, new WeakSet()) as Record<string, unknown>;
+}
+
+function sanitizeValue(value: unknown, seen: WeakSet<object>): unknown {
+  if (Array.isArray(value)) {
+    if (seen.has(value)) return "[redacted-circular]";
+    seen.add(value);
+    return value.map((item) => sanitizeValue(item, seen));
+  }
+  if (typeof value !== "object" || value === null) return value;
+  if (seen.has(value)) return "[redacted-circular]";
+  seen.add(value);
+  return Object.fromEntries(Object.entries(value).map(([key, item]) =>
+    /secret|token|password|authorization|credential|api[-_]?key/i.test(key)
+      ? [key, "[redacted]"]
+      : [key, sanitizeValue(item, seen)],
+  ));
+}

@@ -10,9 +10,10 @@ test("rejects paths outside the canonical repository boundary", () => {
 });
 
 test("makes denied ambient calls side-effect-free and redacts their audit input", () => {
-  const request = { tool: "shell/run", effect: "ambient" as const, input: { password: "never-record", command: "git status" }, operationKey: "operation-1" };
+  const request = { tool: "shell/run", effect: "ambient" as const, input: { password: "never-record", command: "git status", nested: { apiKey: "also-never-record" } }, operationKey: "operation-1" };
   const decision = authorize(request, undefined, "/workspace/repo", false);
   assert.equal(decision.allowed, false); assert.equal(decision.sanitizedInput.password, "[redacted]");
+  assert.deepEqual(decision.sanitizedInput.nested, { apiKey: "[redacted]" });
   assert.equal(audit(request, decision, "snapshot-1").operationKey, "operation-1");
   const { operationKey: _ignored, ...operation } = request;
   assert.equal(operationKey(operation), operationKey(operation));

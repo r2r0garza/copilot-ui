@@ -4,7 +4,7 @@ import { join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import { TextDecoder } from "node:util";
 
-import { validateRepositoryPath } from "../execution-authority/policy";
+import { secretMinimizedEnvironment, validateRepositoryPath } from "../execution-authority";
 import type { ToolResource } from "../resources/catalog";
 
 const MAX_GIT_OUTPUT_BYTES = 1024 * 1024;
@@ -250,7 +250,7 @@ export class SafeGitExecutor {
       timeout: 15_000,
       maxBuffer: MAX_GIT_OUTPUT_BYTES,
       windowsHide: true,
-      env: safeGitEnvironment(),
+      env: safeGitEnvironment(nullDevice),
     });
     if (result.error || result.signal || !acceptedStatuses.includes(result.status ?? -1)) throw new Error(`safe-git-command-failed:${arguments_[0] ?? "unknown"}`);
     try { return { status: result.status ?? -1, stdout: UTF8.decode(result.stdout) }; }
@@ -291,23 +291,27 @@ function parsePorcelain(output: string): readonly GitStatusEntry[] {
   return entries;
 }
 
-function safeGitEnvironment(): NodeJS.ProcessEnv {
-  const allowed = ["PATH", "PATHEXT", "SystemRoot", "WINDIR", "HOME", "USERPROFILE", "TMPDIR", "TMP", "TEMP"];
-  const environment: NodeJS.ProcessEnv = {};
-  for (const name of allowed) if (process.env[name]) environment[name] = process.env[name];
-  return {
-    ...environment,
-    LC_ALL: "C",
-    LANG: "C",
-    GIT_TERMINAL_PROMPT: "0",
-    GIT_ASKPASS: process.platform === "win32" ? "cmd /c exit 1" : "/usr/bin/false",
-    SSH_ASKPASS: process.platform === "win32" ? "cmd /c exit 1" : "/usr/bin/false",
-    GIT_EDITOR: process.platform === "win32" ? "cmd /c exit 1" : "/usr/bin/false",
-    GIT_SEQUENCE_EDITOR: process.platform === "win32" ? "cmd /c exit 1" : "/usr/bin/false",
-    GIT_OPTIONAL_LOCKS: "0",
-    GIT_NO_REPLACE_OBJECTS: "1",
-    GIT_ALLOW_PROTOCOL: "",
-  };
+function safeGitEnvironment(nullDevice: string): Readonly<NodeJS.ProcessEnv> {
+  const noInteraction = process.platform === "win32" ? "cmd /c exit 1" : "/usr/bin/false";
+  return secretMinimizedEnvironment({
+    inherit: ["PATH", "PATHEXT", "SystemRoot", "WINDIR", "TMPDIR", "TMP", "TEMP"],
+    neutralHome: nullDevice,
+    fixed: {
+      LC_ALL: "C",
+      LANG: "C",
+      GIT_CONFIG_NOSYSTEM: "1",
+      GIT_CONFIG_SYSTEM: nullDevice,
+      GIT_CONFIG_GLOBAL: nullDevice,
+      GIT_TERMINAL_PROMPT: "0",
+      GIT_ASKPASS: noInteraction,
+      SSH_ASKPASS: noInteraction,
+      GIT_EDITOR: noInteraction,
+      GIT_SEQUENCE_EDITOR: noInteraction,
+      GIT_OPTIONAL_LOCKS: "0",
+      GIT_NO_REPLACE_OBJECTS: "1",
+      GIT_ALLOW_PROTOCOL: "",
+    },
+  });
 }
 
 function tool(

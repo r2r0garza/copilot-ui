@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 
+import { secretMinimizedEnvironment } from "../execution-authority";
 import type { Diagnostic, McpServer, ResourceStatus } from "./catalog";
 
 export type McpTransport = "stdio" | "http" | "sse";
@@ -151,7 +152,10 @@ export function prepareMcpConnection(
 
   try {
     const resolve = (value: string): string => substituteVariables(value, values);
-    const environment = Object.fromEntries(Object.entries(server.environment).map(([key, value]) => [key, resolve(value)]));
+    const environment = secretMinimizedEnvironment({
+      host: {},
+      explicit: Object.fromEntries(Object.entries(server.environment).map(([key, value]) => [key, resolve(value)])),
+    });
     const headers = Object.fromEntries(Object.entries(server.headers).map(([key, value]) => [key, resolve(value)]));
     const command = server.command === undefined ? undefined : resolve(server.command);
     const url = server.url === undefined ? undefined : resolve(server.url);
@@ -229,6 +233,8 @@ function parseServer(
   const headers = stringRecord(value.headers);
   const cwd = optionalString(value.cwd);
   if (!args || !environment || !headers || cwd.invalid) return invalid("Arguments, cwd, environment, or headers have an invalid shape.");
+  try { secretMinimizedEnvironment({ host: {}, explicit: environment }); }
+  catch (error) { return invalid(error instanceof Error ? error.message : "Execution environment is invalid.", "mcp.environment-prohibited"); }
   if (value.envFile !== undefined) return invalid("Environment files are not loaded implicitly.", "mcp.env-file-prohibited");
 
   if (value.dev !== undefined) addDiagnostic(diagnostics, resourceName, "mcp.dev-ignored", "warning", "Native MCP dev.watch and dev.debug settings are ignored.");

@@ -75,6 +75,18 @@ test("malformed input and server entries stay isolated from unrelated servers", 
   assert.equal(isolated.servers.find((server) => server.name === "envFile")?.status, "invalid");
 });
 
+test("rejects process-injection variables before an MCP server reaches execution", () => {
+  const catalog = readMcpConfiguration(mcpFile({
+    servers: {
+      valid: { command: "node", env: { REGION: "test" } },
+      injected: { command: "node", env: { NODE_OPTIONS: "--require=./repository-code.js" } },
+    },
+  }));
+  assert.equal(catalog.servers.find((server) => server.name === "valid")?.status, "available");
+  assert.equal(catalog.servers.find((server) => server.name === "injected")?.status, "invalid");
+  assert.equal(catalog.diagnostics.some((item) => item.code === "mcp.environment-prohibited"), true);
+});
+
 test("input resolution cannot prompt or execute commands without a user action", async () => {
   const calls: string[] = [];
   const port: McpInputPort = {
