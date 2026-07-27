@@ -22,6 +22,7 @@ export interface Runtime extends Disposable {
 
 export interface CreateRuntimeOptions {
   readonly workspaceStorageUri: Uri | undefined;
+  readonly resources?: ResourceService;
   readonly commandHandler?: ApplicationCommandHandler;
   readonly ports?: RuntimePorts;
 }
@@ -40,13 +41,13 @@ export function createRuntime(_options: CreateRuntimeOptions): Runtime {
     chats: unavailableService("chats"),
     executionAuthority: unavailableService("execution authority"),
     memory: unavailableService("memory"),
-    resources: unavailableService("resources"),
+    resources: _options.resources ?? unavailableService("resources"),
     tasks: unavailableService("tasks"),
     execute(request): Promise<ApplicationResult> {
       return commandHandler.execute(request, ports);
     },
     dispose(): void {
-      // Future adapters own cleanup through this root.
+      _options.resources?.dispose();
     },
   };
 }

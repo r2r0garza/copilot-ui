@@ -3,3 +3,5 @@ out/
 .tmp-test/
 pnpm-lock.yaml
 pnpm-workspace.yaml
+test-workbench/
+.DS_Store

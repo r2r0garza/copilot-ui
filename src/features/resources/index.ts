@@ -1,2 +1,3 @@
-/** Public application boundary for Agent, Skill, Tool, and MCP discovery. */
-export interface ResourceService {}
+export * from "./catalog";
+export * from "./mcp";
+export * from "./service";
