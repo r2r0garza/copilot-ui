@@ -23,7 +23,7 @@ with an in-memory adapter for deterministic headless tests.
 Run:
 
 ```sh
-npm run verify
+npm test
 ```
 
 Observed milestone scenarios:
