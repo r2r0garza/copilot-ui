@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -54,15 +55,39 @@ test("restores an interrupted streamed response and replaces it with its immutab
 test("keeps lifecycle, forks, trash, summaries, ledger, and audits append-only", () => {
   const store = new WorkspaceStore(mkdtempSync(join(tmpdir(), "bridgit-m2-")));
   const chat = store.createChat("bundled:orchestrator", null); const turn = store.submitTurn(chat.chatId, "Use a tool");
-  const attempt = store.createResponseAttempt(turn.turnId, "model-a", undefined, "model-a", "snapshot-1");
+  const attempt = store.createResponseAttempt(turn.turnId, "model-a", undefined, "model-a");
+  const fixture = snapshotFixture({ attemptId: attempt.attemptId, model: "model-a" });
+  const snapshotId = fixture.snapshotId;
+  const snapshot = store.pinResourceSnapshot(attempt.attemptId, snapshotId, fixture.content);
+  assert.equal(snapshot.attemptId, attempt.attemptId);
+  assert.equal(store.getResponseAttempt(attempt.attemptId)?.snapshotId, snapshotId);
   store.transitionAttempt(attempt.attemptId, "running"); store.transitionAttempt(attempt.attemptId, "cancelled");
   const ledger = store.appendLedger(chat.chatId, "fact", "User prefers tests", "user-turn"); store.correctLedger(ledger.entryId, "User prefers focused tests", "user-correction");
   store.createSummary(chat.chatId, "Short history", "turns:1");
-  store.recordToolAudit({ auditId: "audit-1", attemptId: attempt.attemptId, operationKey: "op-1", toolIdentity: "files/read", snapshotId: "snapshot-1", decision: "allowed", input: "{}", outcome: null, createdAt: "2026-07-25T00:00:00.000Z", completedAt: null });
-  const snapshot = store.pinResourceSnapshot(attempt.attemptId, "{\"model\":\"model-a\"}"); assert.equal(snapshot.attemptId, attempt.attemptId);
+  store.recordToolAudit({ auditId: "audit-1", attemptId: attempt.attemptId, operationKey: "op-1", toolIdentity: "files/read", snapshotId, decision: "allowed", input: "{}", outcome: null, createdAt: "2026-07-25T00:00:00.000Z", completedAt: null });
   assert.equal(store.acquireRepositoryWriteLock(attempt.attemptId), true); assert.equal(store.repositoryWriteLocked(), true); assert.equal(store.releaseRepositoryWriteLock(attempt.attemptId), true);
   const fork = store.forkChat(chat.chatId, "bundled:orchestrator"); store.trashChat(chat.chatId); assert.equal(store.listChats().length, 1); assert.equal(store.listChats()[0]?.chatId, fork.chatId);
   store.restoreChat(chat.chatId); assert.equal(store.listChats().length, 2); store.close();
+});
+
+test("pins one exact immutable Resource Snapshot identity per preparing attempt", () => {
+  const store = new WorkspaceStore(mkdtempSync(join(tmpdir(), "bridgit-snapshot-")));
+  const chat = store.createChat("reviewer", null);
+  const turn = store.submitTurn(chat.chatId, "Review this.");
+  const attempt = store.createResponseAttempt(turn.turnId, null, "2026-07-27T00:00:00.000Z", "model-a");
+  const { snapshotId, content } = snapshotFixture({ attemptId: attempt.attemptId, catalogRevision: 3, effectiveModelId: "model-a" });
+
+  const pinned = store.pinResourceSnapshot(attempt.attemptId, snapshotId, content, "2026-07-27T00:00:01.000Z");
+  assert.equal(pinned.snapshotId, snapshotId);
+  assert.deepEqual(store.getResourceSnapshot(attempt.attemptId), pinned);
+  assert.equal(store.getResponseAttempt(attempt.attemptId)?.effectiveModelId, "model-a");
+  assert.equal(store.getResponseAttempt(attempt.attemptId)?.snapshotId, snapshotId);
+  assert.throws(() => store.pinResourceSnapshot(attempt.attemptId, snapshotId, content), /already-pinned/);
+  assert.throws(() => store.pinResourceSnapshot(attempt.attemptId, "c".repeat(64), content), /identity-mismatch/);
+  assert.throws(() => store.pinResourceSnapshot("different-attempt", snapshotId, content), /attempt-mismatch/);
+  const tampered = JSON.stringify({ ...JSON.parse(content), effectiveModelId: "model-b" });
+  assert.throws(() => store.pinResourceSnapshot(attempt.attemptId, snapshotId, tampered), /checksum-mismatch/);
+  store.close();
 });
 
 test("binds MCP Server Trust to the exact durable configuration fingerprint", () => {
@@ -102,3 +127,8 @@ test("turns an abandoned active attempt into an interrupted, retryable record on
   const writer = new WorkspaceStore(directory); const chat = writer.createChat("bundled:orchestrator", null); const turn = writer.submitTurn(chat.chatId, "Continue"); const attempt = writer.createResponseAttempt(turn.turnId, "model-a"); writer.transitionAttempt(attempt.attemptId, "running"); writer.close();
   const reader = new WorkspaceStore(directory); assert.doesNotThrow(() => reader.createResponseAttempt(turn.turnId, "model-a")); reader.close();
 });
+
+function snapshotFixture(payload: Readonly<Record<string, unknown>>): { readonly snapshotId: string; readonly content: string } {
+  const snapshotId = createHash("sha256").update(JSON.stringify(payload)).digest("hex");
+  return { snapshotId, content: JSON.stringify({ snapshotId, ...payload }) };
+}

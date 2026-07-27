@@ -4,6 +4,7 @@ import {
   discoverResources,
   pinSnapshot,
   type AgentResource,
+  type EffectiveModelSnapshot,
   type ResourceCatalog,
   type ResourceSnapshot,
   type ToolResource,
@@ -28,7 +29,7 @@ export interface ResourceService {
   refresh(): ResourceCatalogState;
   setWorkspace(workspaceRoot: string | null, workspaceName?: string): ResourceCatalogState;
   onDidChange(listener: (state: ResourceCatalogState) => void): ResourceSubscription;
-  createSnapshot(agent: AgentResource, effectiveModelId: string, tools: readonly ToolResource[], now?: string): ResourceSnapshot;
+  createSnapshot(attemptId: string, agent: AgentResource, effectiveModel: EffectiveModelSnapshot, now?: string): ResourceSnapshot;
   dispose(): void;
 }
 
@@ -79,9 +80,9 @@ export class ResourceCatalogController implements ResourceService {
     return { dispose: () => this.listeners.delete(listener) };
   }
 
-  public createSnapshot(agent: AgentResource, effectiveModelId: string, tools: readonly ToolResource[], now = this.now()): ResourceSnapshot {
+  public createSnapshot(attemptId: string, agent: AgentResource, effectiveModel: EffectiveModelSnapshot, now = this.now()): ResourceSnapshot {
     this.assertActive();
-    return pinSnapshot(this.state.catalog, agent, effectiveModelId, tools, now, this.state.revision);
+    return pinSnapshot(this.state.catalog, agent, effectiveModel, attemptId, now, this.state.revision);
   }
 
   public dispose(): void {

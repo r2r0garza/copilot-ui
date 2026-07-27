@@ -37,15 +37,19 @@ test("pins the active catalog revision without hot-swapping prior snapshots", ()
   writeAgent(root, "reviewer", "description: Review code");
   const controller = new ResourceCatalogController(root, "fixture", () => "2026-07-26T00:00:00.000Z");
   const agent = controller.getState().catalog.agents[0];
-  const first = controller.createSnapshot(agent, "model-a", []);
+  const first = controller.createSnapshot("attempt-1", agent, effectiveModel());
 
   writeAgent(root, "reviewer", "description: Updated review behavior");
   controller.refresh();
-  const second = controller.createSnapshot(controller.getState().catalog.agents[0], "model-a", []);
+  const second = controller.createSnapshot("attempt-2", controller.getState().catalog.agents[0], effectiveModel());
 
   assert.equal(first.catalogRevision, 1);
   assert.equal(second.catalogRevision, 2);
+  assert.equal(first.attemptId, "attempt-1");
+  assert.equal(first.agent.description, "Review code");
+  assert.equal(second.agent.description, "Updated review behavior");
   assert.notEqual(first.catalogFingerprint, second.catalogFingerprint);
+  assert.notEqual(first.snapshotId, second.snapshotId);
   assert.equal(first.catalogRevision, 1);
   controller.dispose();
 });
@@ -100,4 +104,8 @@ function workspace(): string {
 
 function writeAgent(root: string, identity: string, frontmatter: string): void {
   writeFileSync(join(root, ".github", "agents", `${identity}.agent.md`), `---\n${frontmatter}\n---\nInstructions.`);
+}
+
+function effectiveModel() {
+  return { id: "model-a", name: "Model A", vendor: "fixture", family: "test", version: "1", maxInputTokens: 4096, selectionSource: "auto" as const };
 }

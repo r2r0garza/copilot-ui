@@ -4,6 +4,7 @@ import * as vscode from "vscode";
 import {
   ResourceCatalogController,
   type AgentResource,
+  type EffectiveModelSnapshot,
   type ResourceCatalogState,
   type ResourceService,
   type ResourceSubscription,
@@ -55,8 +56,8 @@ export class VsCodeWorkspaceResourceService implements ResourceService {
     return this.controller.onDidChange(listener);
   }
 
-  public createSnapshot(agent: AgentResource, effectiveModelId: string, tools: readonly ToolResource[], now?: string): ResourceSnapshot {
-    return this.controller.createSnapshot(agent, effectiveModelId, tools, now);
+  public createSnapshot(attemptId: string, agent: AgentResource, effectiveModel: EffectiveModelSnapshot, now?: string): ResourceSnapshot {
+    return this.controller.createSnapshot(attemptId, agent, effectiveModel, now);
   }
 
   public dispose(): void {

@@ -34,8 +34,20 @@ test("keeps explicit tool allowlists narrow and pins immutable snapshots", () =>
   assert.deepEqual(selectTools(tools, ["files/read", "unknown/tool"]).map((tool) => tool.identity), ["files/read"]);
   assert.deepEqual(resolveToolSelection(tools, ["files/read", "unknown/tool", "bad*"]).unresolved, ["unknown/tool", "bad*"]);
   const catalog = { agents: [], skills: [], mcpServers: [], tools: [], diagnostics: [] };
-  const snapshot = pinSnapshot(catalog, { identity: "a", description: "d", instructions: "i", model: null, tools: null, status: "available" }, "model-a", tools, "2026-07-25T00:00:00.000Z");
-  assert.equal(snapshot.tools.length, 2); assert.equal(snapshot.effectiveModelId, "model-a");
+  const snapshot = pinSnapshot(
+    { ...catalog, tools },
+    { identity: "a", description: "d", instructions: "i", model: null, tools: ["files/read", "missing/tool"], status: "available" },
+    effectiveModel(),
+    "attempt-1",
+    "2026-07-25T00:00:00.000Z",
+  );
+  assert.deepEqual(snapshot.tools.map((tool) => tool.identity), ["files/read"]);
+  assert.deepEqual(snapshot.unresolvedToolSelectors, ["missing/tool"]);
+  assert.equal(snapshot.effectiveModelId, "model-a");
+  assert.equal(snapshot.effectiveModel.version, "1");
+  assert.equal(Object.isFrozen(snapshot), true);
+  assert.equal(Object.isFrozen(snapshot.agent), true);
+  assert.equal(Object.isFrozen(snapshot.tools[0].inputSchema), true);
 });
 
 test("preserves Tool origins and disables every cross-source identity collision", () => {
@@ -128,4 +140,8 @@ function workspace(): string {
 
 function writeAgent(root: string, identity: string, frontmatter: string): void {
   writeFileSync(join(root, ".github", "agents", `${identity}.agent.md`), `---\n${frontmatter}\n---\nInstructions.`);
+}
+
+function effectiveModel() {
+  return { id: "model-a", name: "Model A", vendor: "fixture", family: "test", version: "1", maxInputTokens: 4096, selectionSource: "auto" as const };
 }

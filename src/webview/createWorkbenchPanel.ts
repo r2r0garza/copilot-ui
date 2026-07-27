@@ -1,8 +1,8 @@
 import * as vscode from "vscode";
 
 import { WorkspaceStore } from "../adapters/sqlite/workspaceStore";
-import { bundledOrchestrator, listChatAgents, resolveAvailableChatAgent } from "../features/chats";
-import type { ResourceCatalogState } from "../features/resources";
+import { bundledOrchestrator, listChatAgents, resolveAvailableChatAgent, selectAvailableModel } from "../features/chats";
+import type { EffectiveModelSnapshot, ResourceCatalogState } from "../features/resources";
 import type { Runtime } from "../runtime/createRuntime";
 import { renderChatsView, type ChatViewState } from "./chatView";
 import { renderResourceCatalog } from "./resourceView";
@@ -107,20 +107,36 @@ export function createWorkbenchPanel(
       const chat = selectedChatId ? authority.getChat(selectedChatId) : undefined;
       const targetChat = chat ?? authority.createChat(draftAgentIdentity, null);
       selectedChatId = targetChat.chatId;
-      const agent = resolveAvailableChatAgent(resourceState, targetChat.agentIdentity);
-      if (!agent) throw new Error("This Chat’s Agent is no longer available. Select an available Agent to start a new Chat.");
+      if (!resolveAvailableChatAgent(resourceState, targetChat.agentIdentity)) throw new Error("This Chat’s Agent is no longer available. Select an available Agent to start a new Chat.");
       const turn = authority.submitTurn(targetChat.chatId, content);
-      const [model] = await vscode.lm.selectChatModels();
-      if (!model) throw new Error("No chat model is available. Sign in to GitHub Copilot and try again.");
-      if (targetChat.title === "New chat") authority.setChatTitle(targetChat.chatId, await generateChatTitle(model, content));
-      const attempt = authority.createResponseAttempt(turn.turnId, model.id, undefined, model.id);
+      const models = await vscode.lm.selectChatModels();
+      const agent = resolveAvailableChatAgent(resourceState, targetChat.agentIdentity);
+      if (!agent) {
+        const failedAttempt = authority.createResponseAttempt(turn.turnId, targetChat.requestedModelId);
+        authority.transitionAttempt(failedAttempt.attemptId, "failed");
+        throw new Error("This Chat’s Agent changed before its Resource Snapshot could be pinned.");
+      }
+      let modelSelection;
+      try {
+        modelSelection = selectAvailableModel(targetChat.requestedModelId, agent.model, models.map((model) => model.id));
+      } catch (error) {
+        const failedAttempt = authority.createResponseAttempt(turn.turnId, targetChat.requestedModelId);
+        authority.transitionAttempt(failedAttempt.attemptId, "failed");
+        throw error;
+      }
+      const model = models.find((candidate) => candidate.id === modelSelection.effectiveModelId);
+      if (!model) throw new Error("effective-model-disappeared");
+      const attempt = authority.createResponseAttempt(turn.turnId, targetChat.requestedModelId, undefined, model.id);
       activeAttemptId = attempt.attemptId;
-      const resourceSnapshot = _runtime.resources.createSnapshot(agent, model.id, []);
-      authority.pinResourceSnapshot(attempt.attemptId, JSON.stringify(resourceSnapshot), resourceSnapshot.createdAt);
+      const resourceSnapshot = _runtime.resources.createSnapshot(attempt.attemptId, agent, modelSnapshot(model, modelSelection.source));
+      authority.pinResourceSnapshot(attempt.attemptId, resourceSnapshot.snapshotId, JSON.stringify(resourceSnapshot), resourceSnapshot.createdAt);
       authority.transitionAttempt(attempt.attemptId, "running");
       const cancellation = new vscode.CancellationTokenSource();
+      if (targetChat.title === "New chat") {
+        authority.setChatTitle(targetChat.chatId, await generateChatTitle(model, content, cancellation.token));
+      }
       const response = await model.sendRequest([
-        vscode.LanguageModelChatMessage.User(`Follow these repository Agent instructions for this response:\n\n${agent.instructions}`),
+        vscode.LanguageModelChatMessage.User(`Follow these repository Agent instructions for this response:\n\n${resourceSnapshot.agent.instructions}`),
         vscode.LanguageModelChatMessage.User(content),
       ], {}, cancellation.token);
       let output = "";
@@ -386,7 +402,28 @@ function chatState(
     workspaceName: resources.workspaceName,
   };
 }
-async function generateChatTitle(model: vscode.LanguageModelChat, firstMessage: string): Promise<string> { try { const prompt = `Write a short, descriptive conversation title based on the first user message below. Aim for 5 to 7 words; never use more than 7. Return only the title, with no labels, quotes, or explanation.\n\n${firstMessage}`; const response = await model.sendRequest([vscode.LanguageModelChatMessage.User(prompt)], {}); let title = ""; for await (const fragment of response.text) title += fragment; const words = title.replace(/["'`*_#.:!?]/g, "").replace(/\s+/g, " ").trim().split(" ").filter(Boolean).slice(0, 7); if (words.length) return words.join(" "); } catch { /* Keep a useful local fallback when a provider cannot serve the second request. */ } return fallbackChatTitle(firstMessage); }
+function modelSnapshot(model: vscode.LanguageModelChat, selectionSource: EffectiveModelSnapshot["selectionSource"]): EffectiveModelSnapshot {
+  return {
+    id: model.id,
+    name: model.name,
+    vendor: model.vendor,
+    family: model.family,
+    version: model.version,
+    maxInputTokens: model.maxInputTokens,
+    selectionSource,
+  };
+}
+async function generateChatTitle(model: vscode.LanguageModelChat, firstMessage: string, token: vscode.CancellationToken): Promise<string> {
+  try {
+    const prompt = `Write a short, descriptive conversation title based on the first user message below. Aim for 5 to 7 words; never use more than 7. Return only the title, with no labels, quotes, or explanation.\n\n${firstMessage}`;
+    const response = await model.sendRequest([vscode.LanguageModelChatMessage.User(prompt)], {}, token);
+    let title = "";
+    for await (const fragment of response.text) title += fragment;
+    const words = title.replace(/["'`*_#.:!?]/g, "").replace(/\s+/g, " ").trim().split(" ").filter(Boolean).slice(0, 7);
+    if (words.length) return words.join(" ");
+  } catch { /* Keep a useful local fallback if the snapshotted model cannot title this Chat. */ }
+  return fallbackChatTitle(firstMessage);
+}
 function fallbackChatTitle(firstMessage: string): string { const words = firstMessage.replace(/[^\p{L}\p{N}\s-]/gu, " ").split(/\s+/).filter(Boolean).slice(0, 7); return words.length ? words.join(" ") : "New chat"; }
 function escapeHtml(value: string): string { return value.replace(/[&<>\"]/g, (character) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[character] ?? character); }
 function isSendMessage(value: unknown): value is { type: "chat-send"; content: string } { return typeof value === "object" && value !== null && (value as { type?: unknown }).type === "chat-send" && typeof (value as { content?: unknown }).content === "string"; }

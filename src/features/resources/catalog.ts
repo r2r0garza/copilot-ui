@@ -68,12 +68,26 @@ export interface ResourceCatalog {
 
 export interface ResourceSnapshot {
   readonly snapshotId: string;
+  readonly attemptId: string;
   readonly createdAt: string;
   readonly catalogRevision: number;
   readonly agentIdentity: string;
+  readonly agent: AgentResource;
   readonly effectiveModelId: string;
+  readonly effectiveModel: EffectiveModelSnapshot;
   readonly tools: readonly ToolResource[];
+  readonly unresolvedToolSelectors: readonly string[];
   readonly catalogFingerprint: string;
+}
+
+export interface EffectiveModelSnapshot {
+  readonly id: string;
+  readonly name: string;
+  readonly vendor: string;
+  readonly family: string;
+  readonly version: string;
+  readonly maxInputTokens: number;
+  readonly selectionSource: "requested" | "agent" | "auto";
 }
 
 const AGENT_FRONTMATTER_BYTES = 32 * 1024;
@@ -148,11 +162,29 @@ export function selectTools(available: readonly ToolResource[], allowlist: reado
   return resolveToolSelection(available, allowlist).tools;
 }
 
-export function pinSnapshot(catalog: ResourceCatalog, agent: AgentResource, effectiveModelId: string, tools: readonly ToolResource[], now = new Date().toISOString(), catalogRevision = 0): ResourceSnapshot {
-  const selectedTools = tools.filter((tool) => tool.status === "available");
-  const payload = JSON.stringify({ catalog, agent: agent.identity, effectiveModelId, tools: selectedTools });
-  const catalogFingerprint = fingerprint(payload);
-  return { snapshotId: fingerprint(`${catalogRevision}:${now}:${payload}`), createdAt: now, catalogRevision, agentIdentity: agent.identity, effectiveModelId, tools: selectedTools, catalogFingerprint };
+export function pinSnapshot(
+  catalog: ResourceCatalog,
+  agent: AgentResource,
+  effectiveModel: EffectiveModelSnapshot,
+  attemptId: string,
+  now = new Date().toISOString(),
+  catalogRevision = 0,
+): ResourceSnapshot {
+  const selection = resolveToolSelection(catalog.tools, agent.tools);
+  const catalogFingerprint = fingerprint(JSON.stringify(catalog));
+  const pinned = immutableClone({
+    attemptId,
+    createdAt: now,
+    catalogRevision,
+    agentIdentity: agent.identity,
+    agent,
+    effectiveModelId: effectiveModel.id,
+    effectiveModel,
+    tools: selection.tools,
+    unresolvedToolSelectors: selection.unresolved,
+    catalogFingerprint,
+  });
+  return deepFreeze({ snapshotId: fingerprint(JSON.stringify(pinned)), ...pinned });
 }
 
 function discoverAgents(directory: string, diagnostics: Diagnostic[]): AgentResource[] {
@@ -429,4 +461,15 @@ function addDiagnostic(diagnostics: Diagnostic[], resource: string, code: string
 
 function fingerprint(value: string): string {
   return createHash("sha256").update(value).digest("hex");
+}
+
+function immutableClone<T>(value: T): T {
+  return JSON.parse(JSON.stringify(value)) as T;
+}
+
+function deepFreeze<T>(value: T): T {
+  if (typeof value !== "object" || value === null || Object.isFrozen(value)) return value;
+  Object.freeze(value);
+  for (const child of Object.values(value)) deepFreeze(child);
+  return value;
 }
