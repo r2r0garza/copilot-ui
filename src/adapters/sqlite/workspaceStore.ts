@@ -7,6 +7,7 @@ import {
   authorityGrantFingerprint,
   authorityReviewConfirmationHash,
   normalizeAuthorityScope,
+  sanitize,
   validateGrantOwner,
   type AuthorityEffectClass,
   type AuthorityGrant,
@@ -15,6 +16,14 @@ import {
   type AuthorityReview,
   type AuthorityReviewDecision,
   type CreateAuthorityReview,
+  type DurableOperation,
+  type OperationExecutionAttempt,
+  type ReconciliationClassification,
+  type ReconciliationEvidence,
+  type RecordToolIntent,
+  type ToolAuditCorrection,
+  type ToolAuditRecord,
+  type ToolOutcomeCode,
 } from "../../features/execution-authority";
 
 export interface ArtifactRef { readonly artifactId: string; readonly mediaType: string; readonly byteCount: number; readonly checksum: string; readonly displayLabel: string; }
@@ -24,7 +33,6 @@ export type AttemptState = "preparing" | "running" | "waiting-for-approval" | "s
 export interface ResponseAttemptRecord { readonly attemptId: string; readonly turnId: string; readonly ordinal: number; readonly state: AttemptState; readonly requestedModelId: string | null; readonly effectiveModelId: string | null; readonly snapshotId: string | null; readonly createdAt: string; readonly endedAt: string | null; }
 export interface OutputRecord { readonly outputId: string; readonly turnId: string; readonly content: string; readonly createdAt: string; }
 export interface EventRecord { readonly sequence: number; readonly name: string; readonly aggregateId: string; readonly payload: string; readonly emittedAt: string; }
-export interface ToolAuditRecord { readonly auditId: string; readonly attemptId: string; readonly operationKey: string; readonly toolIdentity: string; readonly snapshotId: string; readonly decision: string; readonly input: string; readonly outcome: string | null; readonly createdAt: string; readonly completedAt: string | null; }
 export interface LedgerEntry { readonly entryId: string; readonly chatId: string; readonly kind: string; readonly content: string; readonly provenance: string; readonly status: "active" | "superseded" | "disputed"; readonly createdAt: string; }
 export interface ResourceSnapshotRecord { readonly snapshotId: string; readonly attemptId: string; readonly content: string; readonly createdAt: string; }
 export interface McpTrustRecord { readonly serverIdentity: string; readonly fingerprint: string; readonly version: number; readonly decision: "trusted" | "denied"; readonly decidedAt: string; readonly invalidatedAt: string | null; }
@@ -39,6 +47,7 @@ export class WorkspaceStore {
     this.db.pragma("journal_mode = WAL");
     this.db.pragma("foreign_keys = ON");
     this.migrate();
+    this.interruptAbandonedOperations();
     this.interruptAbandonedAttempts();
   }
 
@@ -78,6 +87,8 @@ export class WorkspaceStore {
     if (!chat?.trashedAt) throw new Error("chat-must-be-trashed-before-permanent-delete");
     const active = this.db.prepare("SELECT 1 FROM response_attempts a JOIN chat_turns t ON t.turn_id = a.turn_id WHERE t.chat_id = ? AND a.state IN ('preparing','running','waiting-for-approval')").get(chatId);
     if (active) throw new Error("chat-has-active-attempt");
+    const unsettledOperation = this.db.prepare("SELECT 1 FROM durable_operations o JOIN response_attempts a ON o.parent_kind = 'response-attempt' AND o.parent_id = a.attempt_id JOIN chat_turns t ON t.turn_id = a.turn_id WHERE t.chat_id = ? AND o.state IN ('executing','reconciling','outcome-unknown')").get(chatId);
+    if (unsettledOperation) throw new Error("chat-has-unsettled-tool-operation");
     const artifacts = this.db.prepare("SELECT content_artifact_id AS artifactId FROM chat_turns WHERE chat_id = ? UNION SELECT o.artifact_id AS artifactId FROM chat_outputs o JOIN chat_turns t ON t.turn_id = o.turn_id WHERE t.chat_id = ?").all(chatId, chatId) as { artifactId: string }[];
     this.transaction(() => {
       this.db.prepare("UPDATE chat_sessions SET origin_chat_id = NULL WHERE origin_chat_id = ?").run(chatId);
@@ -97,8 +108,131 @@ export class WorkspaceStore {
   public createSummary(chatId: string, content: string, provenance: string, now = new Date().toISOString()): string { const summaryId = randomUUID(); this.transaction(() => { this.db.prepare("UPDATE chat_summaries SET active = 0 WHERE chat_id = ? AND active = 1").run(chatId); this.db.prepare("INSERT INTO chat_summaries VALUES (?, ?, ?, ?, 1, ?)").run(summaryId, chatId, content, provenance, now); this.appendEvent("chat.summary-created", chatId, JSON.stringify({ summaryId }), now); }); return summaryId; }
   public appendLedger(chatId: string, kind: string, content: string, provenance: string, now = new Date().toISOString()): LedgerEntry { const entry: LedgerEntry = { entryId: randomUUID(), chatId, kind, content, provenance, status: "active", createdAt: now }; this.transaction(() => { this.db.prepare("INSERT INTO session_ledger VALUES (@entryId, @chatId, @kind, @content, @provenance, @status, @createdAt)").run(entry); this.appendEvent("chat.ledger-appended", chatId, JSON.stringify({ entryId: entry.entryId }), now); }); return entry; }
   public correctLedger(entryId: string, content: string, provenance: string, now = new Date().toISOString()): LedgerEntry { const prior = this.db.prepare("SELECT entry_id as entryId, chat_id as chatId, kind, content, provenance, status, created_at as createdAt FROM session_ledger WHERE entry_id = ?").get(entryId) as LedgerEntry | undefined; if (!prior) throw new Error("ledger-entry-not-found"); const replacement = this.appendLedger(prior.chatId, prior.kind, content, provenance, now); this.db.prepare("UPDATE session_ledger SET status = 'superseded' WHERE entry_id = ?").run(entryId); return replacement; }
-  public recordToolAudit(record: ToolAuditRecord): void { this.transaction(() => { this.db.prepare("INSERT INTO tool_audits VALUES (@auditId, @attemptId, @operationKey, @toolIdentity, @snapshotId, @decision, @input, @outcome, @createdAt, @completedAt)").run(record); this.appendEvent("tool.audit-recorded", record.attemptId, JSON.stringify({ auditId: record.auditId, decision: record.decision }), record.createdAt); }); }
-  public completeToolOperation(auditId: string, outcome: string, now = new Date().toISOString()): void { this.db.prepare("UPDATE tool_audits SET outcome = ?, completed_at = ? WHERE audit_id = ? AND completed_at IS NULL").run(outcome, now, auditId); }
+  public recordToolIntent(input: RecordToolIntent, now = new Date().toISOString()): DurableOperation {
+    validateHash(input.operationKey, "operation-key");
+    validateHash(input.targetFingerprint, "target-fingerprint");
+    if (!/^[A-Za-z0-9._-]+\/[A-Za-z0-9._/-]+$/.test(input.toolIdentity)) throw new Error("tool-identity-invalid");
+    if (!input.parentId.trim()) throw new Error("operation-parent-invalid");
+    if (input.parentKind === "response-attempt" && !this.getResponseAttempt(input.parentId)) throw new Error("response-attempt-not-found");
+    if (input.parentKind === "response-attempt" && input.resourceSnapshotId === null) throw new Error("tool-operation-requires-resource-snapshot");
+    if (input.resourceSnapshotId !== null) validateHash(input.resourceSnapshotId, "resource-snapshot-id");
+    if (input.decisionCode === "allowed" && input.effectClass !== "read" && input.authorityGrantId === null) throw new Error("mutating-operation-requires-authority");
+    const sanitizedInput = boundedSanitizedRecord(input.input, "tool-input");
+    const affectedTargets = boundedTargets(input.affectedTargets);
+    const inputFingerprint = createHash("sha256").update(canonicalJson(sanitizedInput)).digest("hex");
+    const intentFingerprint = createHash("sha256").update(canonicalJson({
+      operationKey: input.operationKey,
+      parentKind: input.parentKind,
+      parentId: input.parentId,
+      effectClass: input.effectClass,
+      authorityGrantId: input.authorityGrantId,
+      resourceSnapshotId: input.resourceSnapshotId,
+      targetFingerprint: input.targetFingerprint,
+      toolIdentity: input.toolIdentity,
+      decisionCode: input.decisionCode,
+      inputFingerprint,
+      affectedTargets,
+    })).digest("hex");
+    const existing = this.getDurableOperationByKey(input.operationKey);
+    if (existing) {
+      if (existing.intentFingerprint !== intentFingerprint) throw new Error("operation-key-conflict");
+      return existing;
+    }
+    const denied = input.decisionCode === "denied";
+    const operation: DurableOperation = {
+      operationId: randomUUID(), version: 1, operationKey: input.operationKey, parentKind: input.parentKind, parentId: input.parentId,
+      state: denied ? "failed" : "intent-recorded", effectClass: input.effectClass, intentFingerprint,
+      authorityGrantId: input.authorityGrantId, resourceSnapshotId: input.resourceSnapshotId, targetFingerprint: input.targetFingerprint,
+      createdAt: now, updatedAt: now, terminalAt: denied ? now : null,
+    };
+    const auditId = randomUUID();
+    this.transaction(() => {
+      this.db.prepare("INSERT INTO durable_operations (operation_id, version, operation_key, parent_kind, parent_id, state, effect_class, intent_fingerprint, authority_grant_id, resource_snapshot_id, target_fingerprint, created_at, updated_at, terminal_at) VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+        .run(operation.operationId, operation.operationKey, operation.parentKind, operation.parentId, operation.state, operation.effectClass, operation.intentFingerprint, operation.authorityGrantId, operation.resourceSnapshotId, operation.targetFingerprint, now, now, operation.terminalAt);
+      this.db.prepare("INSERT INTO tool_audit_records (audit_id, operation_id, ordinal, tool_identity, effect_class, authority_review_id, decision_code, input_fingerprint, sanitized_input_json, sanitized_result_json, affected_targets_json, started_at, terminal_at, outcome_code) VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, NULL, ?, NULL, ?, ?)")
+        .run(auditId, operation.operationId, input.toolIdentity, input.effectClass, input.authorityReviewId, input.decisionCode, inputFingerprint, JSON.stringify(sanitizedInput), JSON.stringify(affectedTargets), denied ? now : null, denied ? "denied" : null);
+      this.appendEvent("operation.intent-recorded", operation.operationId, JSON.stringify({ operationKey: operation.operationKey, auditId, decisionCode: input.decisionCode }), now);
+    });
+    return operation;
+  }
+  public beginToolEffect(operationId: string, now = new Date().toISOString()): OperationExecutionAttempt {
+    const operation = this.getDurableOperation(operationId);
+    if (!operation || (operation.state !== "intent-recorded" && operation.state !== "retry-wait")) throw new Error("operation-not-ready-for-handoff");
+    if (operation.state === "retry-wait") {
+      const proof = this.db.prepare("SELECT 1 FROM reconciliation_evidence WHERE operation_id = ? AND classification = 'not-applied' UNION SELECT 1 FROM operation_execution_attempts WHERE operation_id = ? AND state = 'known-not-applied'").get(operationId, operationId);
+      if (!proof) throw new Error("operation-retry-requires-not-applied-proof");
+    }
+    const count = this.db.prepare("SELECT COUNT(*) AS count FROM operation_execution_attempts WHERE operation_id = ?").get(operationId) as { count: number };
+    const attempt: OperationExecutionAttempt = { operationId, ordinal: count.count + 1, state: "executing", handoffStartedAt: now, finishedAt: null, sanitizedOutcomeCode: null };
+    this.transaction(() => {
+      const changed = this.db.prepare("UPDATE durable_operations SET version = version + 1, state = 'executing', updated_at = ?, terminal_at = NULL WHERE operation_id = ? AND state IN ('intent-recorded','retry-wait')").run(now, operationId);
+      if (changed.changes !== 1) throw new Error("operation-not-ready-for-handoff");
+      this.db.prepare("INSERT INTO operation_execution_attempts (operation_id, ordinal, state, handoff_started_at, finished_at, sanitized_outcome_code) VALUES (?, ?, 'executing', ?, NULL, NULL)").run(operationId, attempt.ordinal, now);
+      this.db.prepare("UPDATE tool_audit_records SET started_at = ? WHERE operation_id = ? AND started_at IS NULL").run(now, operationId);
+      if (operation.state === "retry-wait") this.appendAuditCorrection(operationId, "retry-after-not-applied", { executionOrdinal: attempt.ordinal }, now);
+      this.appendEvent("operation.effect-handoff-started", operationId, JSON.stringify({ ordinal: attempt.ordinal }), now);
+    });
+    return attempt;
+  }
+  public recordToolOutcome(operationId: string, outcome: "applied" | "not-applied" | "failed", result: Readonly<Record<string, unknown>>, affectedTargets: readonly string[], now = new Date().toISOString()): DurableOperation {
+    const operation = this.getDurableOperation(operationId);
+    if (!operation || operation.state !== "executing") throw new Error("operation-not-executing");
+    const sanitizedResult = boundedSanitizedRecord(result, "tool-result");
+    const targets = boundedTargets(affectedTargets);
+    const attempt = this.currentExecutionAttempt(operationId);
+    if (!attempt) throw new Error("operation-execution-attempt-not-found");
+    const attemptState = outcome === "applied" ? "known-applied" : outcome === "not-applied" ? "known-not-applied" : "failed";
+    const operationState = outcome === "applied" ? "succeeded" : outcome === "not-applied" ? "retry-wait" : "failed";
+    const terminalAt = operationState === "retry-wait" ? null : now;
+    this.transaction(() => {
+      this.db.prepare("UPDATE operation_execution_attempts SET state = ?, finished_at = ?, sanitized_outcome_code = ? WHERE operation_id = ? AND ordinal = ? AND state = 'executing'").run(attemptState, now, outcome, operationId, attempt.ordinal);
+      this.db.prepare("UPDATE durable_operations SET version = version + 1, state = ?, updated_at = ?, terminal_at = ? WHERE operation_id = ? AND state = 'executing'").run(operationState, now, terminalAt, operationId);
+      const auditUpdate = this.db.prepare("UPDATE tool_audit_records SET sanitized_result_json = ?, affected_targets_json = ?, terminal_at = ?, outcome_code = ? WHERE operation_id = ? AND outcome_code IS NULL").run(JSON.stringify(sanitizedResult), JSON.stringify(targets), now, outcome, operationId);
+      if (auditUpdate.changes === 0) this.appendAuditCorrection(operationId, `retry-${outcome}`, { sanitizedResult, affectedTargets: targets, executionOrdinal: attempt.ordinal }, now);
+      if (outcome !== "not-applied") this.db.prepare("UPDATE operation_barriers SET removed_at = ?, removal_reason = ? WHERE operation_id = ? AND removed_at IS NULL").run(now, `known-${outcome}`, operationId);
+      this.appendEvent(`operation.${operationState}`, operationId, JSON.stringify({ outcome, ordinal: attempt.ordinal }), now);
+    });
+    return this.getDurableOperation(operationId) as DurableOperation;
+  }
+  public markToolOutcomeUnknown(operationId: string, now = new Date().toISOString()): DurableOperation {
+    const operation = this.getDurableOperation(operationId);
+    if (!operation || operation.state !== "executing") throw new Error("operation-not-executing");
+    const attempt = this.currentExecutionAttempt(operationId);
+    if (!attempt) throw new Error("operation-execution-attempt-not-found");
+    const readOnly = operation.effectClass === "read";
+    this.transaction(() => {
+      this.db.prepare("UPDATE operation_execution_attempts SET state = 'interrupted', finished_at = ?, sanitized_outcome_code = 'interrupted' WHERE operation_id = ? AND ordinal = ? AND state = 'executing'").run(now, operationId, attempt.ordinal);
+      this.db.prepare("UPDATE durable_operations SET version = version + 1, state = ?, updated_at = ?, terminal_at = ? WHERE operation_id = ? AND state = 'executing'").run(readOnly ? "failed" : "outcome-unknown", now, readOnly ? now : null, operationId);
+      const auditUpdate = this.db.prepare("UPDATE tool_audit_records SET terminal_at = ?, outcome_code = ? WHERE operation_id = ? AND outcome_code IS NULL").run(now, readOnly ? "interrupted" : "unknown", operationId);
+      if (auditUpdate.changes === 0) this.appendAuditCorrection(operationId, "effect-interrupted", { executionOrdinal: attempt.ordinal, outcome: readOnly ? "interrupted-read" : "unknown" }, now);
+      if (!readOnly) this.ensureOperationBarrier(operation, now);
+      this.appendEvent(readOnly ? "operation.failed" : "operation.outcome-unknown", operationId, JSON.stringify({ ordinal: attempt.ordinal }), now);
+    });
+    return this.getDurableOperation(operationId) as DurableOperation;
+  }
+  public startOperationReconciliation(operationId: string, now = new Date().toISOString()): void {
+    this.transaction(() => {
+      const result = this.db.prepare("UPDATE durable_operations SET version = version + 1, state = 'reconciling', updated_at = ? WHERE operation_id = ? AND state = 'outcome-unknown'").run(now, operationId);
+      if (result.changes !== 1) throw new Error("operation-not-awaiting-reconciliation");
+      this.appendEvent("operation.reconciliation-started", operationId, "{}", now);
+    });
+  }
+  public recordReconciliation(operationId: string, classification: ReconciliationClassification, delta: Readonly<Record<string, unknown>>, now = new Date().toISOString()): ReconciliationEvidence {
+    const operation = this.getDurableOperation(operationId);
+    if (!operation || operation.state !== "reconciling") throw new Error("operation-not-reconciling");
+    const sanitizedDelta = boundedSanitizedRecord(delta, "reconciliation-delta");
+    const count = this.db.prepare("SELECT COUNT(*) AS count FROM reconciliation_evidence WHERE operation_id = ?").get(operationId) as { count: number };
+    const evidence: ReconciliationEvidence = { evidenceId: randomUUID(), operationId, ordinal: count.count + 1, classification, observedAt: now };
+    const nextState = classification === "applied" ? "succeeded" : classification === "not-applied" ? "retry-wait" : "outcome-unknown";
+    this.transaction(() => {
+      this.db.prepare("INSERT INTO reconciliation_evidence (evidence_id, operation_id, ordinal, classification, observed_at) VALUES (?, ?, ?, ?, ?)").run(evidence.evidenceId, operationId, evidence.ordinal, classification, now);
+      this.appendAuditCorrection(operationId, `reconciliation-${classification}`, sanitizedDelta, now);
+      this.db.prepare("UPDATE durable_operations SET version = version + 1, state = ?, updated_at = ?, terminal_at = ? WHERE operation_id = ? AND state = 'reconciling'").run(nextState, now, nextState === "succeeded" ? now : null, operationId);
+      if (classification === "applied") this.db.prepare("UPDATE operation_barriers SET removed_at = ?, removal_reason = ? WHERE operation_id = ? AND removed_at IS NULL").run(now, "reconciled-applied", operationId);
+      this.appendEvent(`operation.reconciled-${classification}`, operationId, JSON.stringify({ evidenceId: evidence.evidenceId }), now);
+    });
+    return evidence;
+  }
   public pinResourceSnapshot(attemptId: string, snapshotId: string, content: string, now = new Date().toISOString()): ResourceSnapshotRecord {
     if (!/^[a-f0-9]{64}$/.test(snapshotId)) throw new Error("resource-snapshot-id-invalid");
     let parsed: unknown;
@@ -209,24 +343,75 @@ export class WorkspaceStore {
   public listOutputs(chatId: string): readonly OutputRecord[] { return this.db.prepare("SELECT o.output_id as outputId, o.turn_id as turnId, a.content, o.created_at as createdAt FROM chat_outputs o JOIN chat_turns t ON t.turn_id = o.turn_id JOIN artifacts a ON a.artifact_id = o.artifact_id WHERE t.chat_id = ? UNION ALL SELECT 'stream:' || s.turn_id as outputId, s.turn_id as turnId, s.content, s.updated_at as createdAt FROM chat_stream_outputs s JOIN chat_turns t ON t.turn_id = s.turn_id WHERE t.chat_id = ? ORDER BY createdAt").all(chatId, chatId) as OutputRecord[]; }
   public getResponseAttempt(attemptId: string): ResponseAttemptRecord | undefined { return this.db.prepare("SELECT attempt_id AS attemptId, turn_id AS turnId, ordinal, state, requested_model_id AS requestedModelId, effective_model_id AS effectiveModelId, snapshot_id AS snapshotId, created_at AS createdAt, ended_at AS endedAt FROM response_attempts WHERE attempt_id = ?").get(attemptId) as ResponseAttemptRecord | undefined; }
   public getResourceSnapshot(attemptId: string): ResourceSnapshotRecord | undefined { return this.db.prepare("SELECT snapshot_id AS snapshotId, attempt_id AS attemptId, content, created_at AS createdAt FROM resource_snapshots WHERE attempt_id = ?").get(attemptId) as ResourceSnapshotRecord | undefined; }
+  public getDurableOperation(operationId: string): DurableOperation | undefined {
+    return this.db.prepare("SELECT operation_id AS operationId, version, operation_key AS operationKey, parent_kind AS parentKind, parent_id AS parentId, state, effect_class AS effectClass, intent_fingerprint AS intentFingerprint, authority_grant_id AS authorityGrantId, resource_snapshot_id AS resourceSnapshotId, target_fingerprint AS targetFingerprint, created_at AS createdAt, updated_at AS updatedAt, terminal_at AS terminalAt FROM durable_operations WHERE operation_id = ?").get(operationId) as DurableOperation | undefined;
+  }
+  public getDurableOperationByKey(operationKey: string): DurableOperation | undefined {
+    return this.db.prepare("SELECT operation_id AS operationId, version, operation_key AS operationKey, parent_kind AS parentKind, parent_id AS parentId, state, effect_class AS effectClass, intent_fingerprint AS intentFingerprint, authority_grant_id AS authorityGrantId, resource_snapshot_id AS resourceSnapshotId, target_fingerprint AS targetFingerprint, created_at AS createdAt, updated_at AS updatedAt, terminal_at AS terminalAt FROM durable_operations WHERE operation_key = ?").get(operationKey) as DurableOperation | undefined;
+  }
+  public listToolAudits(operationId: string): readonly ToolAuditRecord[] {
+    const rows = this.db.prepare("SELECT audit_id AS auditId, operation_id AS operationId, ordinal, tool_identity AS toolIdentity, effect_class AS effectClass, authority_review_id AS authorityReviewId, decision_code AS decisionCode, input_fingerprint AS inputFingerprint, sanitized_input_json AS sanitizedInputJson, sanitized_result_json AS sanitizedResultJson, affected_targets_json AS affectedTargetsJson, started_at AS startedAt, terminal_at AS terminalAt, outcome_code AS outcomeCode FROM tool_audit_records WHERE operation_id = ? ORDER BY ordinal").all(operationId) as ToolAuditRow[];
+    return rows.map(mapToolAudit);
+  }
+  public listOperationAttempts(operationId: string): readonly OperationExecutionAttempt[] {
+    return this.db.prepare("SELECT operation_id AS operationId, ordinal, state, handoff_started_at AS handoffStartedAt, finished_at AS finishedAt, sanitized_outcome_code AS sanitizedOutcomeCode FROM operation_execution_attempts WHERE operation_id = ? ORDER BY ordinal").all(operationId) as OperationExecutionAttempt[];
+  }
+  public listReconciliationEvidence(operationId: string): readonly ReconciliationEvidence[] {
+    return this.db.prepare("SELECT evidence_id AS evidenceId, operation_id AS operationId, ordinal, classification, observed_at AS observedAt FROM reconciliation_evidence WHERE operation_id = ? ORDER BY ordinal").all(operationId) as ReconciliationEvidence[];
+  }
+  public listToolAuditCorrections(operationId: string): readonly ToolAuditCorrection[] {
+    const rows = this.db.prepare("SELECT c.correction_id AS correctionId, c.audit_id AS auditId, c.ordinal, c.reason_code AS reasonCode, c.sanitized_delta_json AS sanitizedDeltaJson, c.created_at AS createdAt FROM tool_audit_corrections c JOIN tool_audit_records a ON a.audit_id = c.audit_id WHERE a.operation_id = ? ORDER BY c.ordinal").all(operationId) as ToolAuditCorrectionRow[];
+    return rows.map((row) => ({
+      correctionId: row.correctionId,
+      auditId: row.auditId,
+      ordinal: row.ordinal,
+      reasonCode: row.reasonCode,
+      sanitizedDelta: JSON.parse(row.sanitizedDeltaJson) as Readonly<Record<string, unknown>>,
+      createdAt: row.createdAt,
+    }));
+  }
+  public operationHasActiveBarrier(operationId: string): boolean {
+    return Boolean(this.db.prepare("SELECT 1 FROM operation_barriers WHERE operation_id = ? AND removed_at IS NULL").get(operationId));
+  }
   public listEvents(): readonly EventRecord[] { return this.db.prepare("SELECT sequence, name, aggregate_id as aggregateId, payload, emitted_at as emittedAt FROM projection_events ORDER BY sequence").all() as EventRecord[]; }
   public close(): void { this.db.close(); }
 
   private createArtifact(mediaType: string, content: string, displayLabel: string): ArtifactRef { const bytes = Buffer.from(content, "utf8"); const ref: ArtifactRef = { artifactId: randomUUID(), mediaType, byteCount: bytes.byteLength, checksum: createHash("sha256").update(bytes).digest("hex"), displayLabel }; this.db.prepare("INSERT INTO artifacts VALUES (?, ?, ?, ?, ?, ?)").run(ref.artifactId, ref.mediaType, ref.byteCount, ref.checksum, ref.displayLabel, content); return ref; }
+  private currentExecutionAttempt(operationId: string): OperationExecutionAttempt | undefined {
+    return this.db.prepare("SELECT operation_id AS operationId, ordinal, state, handoff_started_at AS handoffStartedAt, finished_at AS finishedAt, sanitized_outcome_code AS sanitizedOutcomeCode FROM operation_execution_attempts WHERE operation_id = ? AND state = 'executing' ORDER BY ordinal DESC LIMIT 1").get(operationId) as OperationExecutionAttempt | undefined;
+  }
+  private appendAuditCorrection(operationId: string, reasonCode: string, delta: Readonly<Record<string, unknown>>, now: string): void {
+    const audit = this.db.prepare("SELECT audit_id AS auditId FROM tool_audit_records WHERE operation_id = ? ORDER BY ordinal LIMIT 1").get(operationId) as { auditId: string } | undefined;
+    if (!audit) throw new Error("tool-audit-not-found");
+    const count = this.db.prepare("SELECT COUNT(*) AS count FROM tool_audit_corrections WHERE audit_id = ?").get(audit.auditId) as { count: number };
+    this.db.prepare("INSERT INTO tool_audit_corrections (correction_id, audit_id, ordinal, reason_code, sanitized_delta_json, created_at) VALUES (?, ?, ?, ?, ?, ?)")
+      .run(randomUUID(), audit.auditId, count.count + 1, reasonCode, JSON.stringify(boundedSanitizedRecord(delta, "audit-correction")), now);
+  }
+  private ensureOperationBarrier(operation: DurableOperation, now: string): void {
+    this.db.prepare("INSERT INTO operation_barriers (barrier_id, operation_id, scope_kind, scope_fingerprint, created_at, removed_at, removal_reason) VALUES (?, ?, ?, ?, ?, NULL, NULL) ON CONFLICT(operation_id) DO NOTHING")
+      .run(randomUUID(), operation.operationId, operation.effectClass === "repository-write" ? "workspace-mutation" : "external-target", operation.targetFingerprint, now);
+  }
   private appendEvent(name: string, aggregateId: string, payload: string, emittedAt: string): void { this.db.prepare("INSERT INTO projection_events (name, aggregate_id, payload, emitted_at) VALUES (?, ?, ?, ?)").run(name, aggregateId, payload, emittedAt); }
   private transaction(work: () => void): void { this.db.transaction(work)(); }
   /** Extension-host restarts cannot resume model work; make any prior in-flight attempt inspectable and retryable. */
+  private interruptAbandonedOperations(): void {
+    const now = new Date().toISOString();
+    const operations = this.db.prepare("SELECT operation_id AS operationId FROM durable_operations WHERE state = 'executing'").all() as { operationId: string }[];
+    for (const operation of operations) this.markToolOutcomeUnknown(operation.operationId, now);
+  }
   private interruptAbandonedAttempts(): void { const now = new Date().toISOString(); this.transaction(() => { const attempts = this.db.prepare("SELECT attempt_id as attemptId FROM response_attempts WHERE state IN ('preparing','running','waiting-for-approval')").all() as { attemptId: string }[]; for (const attempt of attempts) { this.db.prepare("UPDATE response_attempts SET state = 'interrupted', ended_at = ? WHERE attempt_id = ?").run(now, attempt.attemptId); this.appendEvent("response.interrupted", attempt.attemptId, JSON.stringify({ reason: "extension-host-restart" }), now); } }); }
   private migrate(): void {
     this.db.exec("CREATE TABLE IF NOT EXISTS artifacts (artifact_id TEXT PRIMARY KEY, media_type TEXT NOT NULL, byte_count INTEGER NOT NULL, checksum TEXT NOT NULL, display_label TEXT NOT NULL, content TEXT NOT NULL); CREATE TABLE IF NOT EXISTS chat_sessions (chat_id TEXT PRIMARY KEY, title TEXT NOT NULL DEFAULT 'New chat', version INTEGER NOT NULL, agent_identity TEXT NOT NULL, requested_model_id TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, origin_chat_id TEXT REFERENCES chat_sessions(chat_id), trashed_at TEXT); CREATE TABLE IF NOT EXISTS chat_turns (turn_id TEXT PRIMARY KEY, chat_id TEXT NOT NULL REFERENCES chat_sessions(chat_id) ON DELETE CASCADE, ordinal INTEGER NOT NULL, content_artifact_id TEXT NOT NULL REFERENCES artifacts(artifact_id), submitted_at TEXT NOT NULL, UNIQUE(chat_id, ordinal)); CREATE TABLE IF NOT EXISTS response_attempts (attempt_id TEXT PRIMARY KEY, turn_id TEXT NOT NULL REFERENCES chat_turns(turn_id) ON DELETE CASCADE, ordinal INTEGER NOT NULL, state TEXT NOT NULL, requested_model_id TEXT, created_at TEXT NOT NULL, effective_model_id TEXT, snapshot_id TEXT, ended_at TEXT, UNIQUE(turn_id, ordinal)); CREATE TABLE IF NOT EXISTS chat_outputs (output_id TEXT PRIMARY KEY, turn_id TEXT NOT NULL REFERENCES chat_turns(turn_id) ON DELETE CASCADE, artifact_id TEXT NOT NULL REFERENCES artifacts(artifact_id), created_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS chat_stream_outputs (turn_id TEXT PRIMARY KEY REFERENCES chat_turns(turn_id) ON DELETE CASCADE, content TEXT NOT NULL, updated_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS chat_summaries (summary_id TEXT PRIMARY KEY, chat_id TEXT NOT NULL REFERENCES chat_sessions(chat_id) ON DELETE CASCADE, content TEXT NOT NULL, provenance TEXT NOT NULL, active INTEGER NOT NULL, created_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS session_ledger (entry_id TEXT PRIMARY KEY, chat_id TEXT NOT NULL REFERENCES chat_sessions(chat_id) ON DELETE CASCADE, kind TEXT NOT NULL, content TEXT NOT NULL, provenance TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS resource_snapshots (snapshot_id TEXT PRIMARY KEY, attempt_id TEXT NOT NULL REFERENCES response_attempts(attempt_id) ON DELETE CASCADE, content TEXT NOT NULL, created_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS repository_write_lock (lock_id INTEGER PRIMARY KEY CHECK(lock_id = 1), holder_id TEXT NOT NULL, acquired_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS mcp_trust (server_identity TEXT NOT NULL, fingerprint TEXT NOT NULL, version INTEGER NOT NULL, decision TEXT NOT NULL CHECK(decision IN ('trusted','denied')), decided_at TEXT NOT NULL, invalidated_at TEXT, PRIMARY KEY(server_identity, fingerprint)); CREATE TABLE IF NOT EXISTS tool_audits (audit_id TEXT PRIMARY KEY, attempt_id TEXT NOT NULL REFERENCES response_attempts(attempt_id) ON DELETE CASCADE, operation_key TEXT NOT NULL, tool_identity TEXT NOT NULL, snapshot_id TEXT NOT NULL, decision TEXT NOT NULL, input TEXT NOT NULL, outcome TEXT, created_at TEXT NOT NULL, completed_at TEXT); CREATE TABLE IF NOT EXISTS projection_events (sequence INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, aggregate_id TEXT NOT NULL, payload TEXT NOT NULL, emitted_at TEXT NOT NULL);");
     this.db.exec("CREATE TABLE IF NOT EXISTS authority_reviews (review_id TEXT PRIMARY KEY, owner_kind TEXT NOT NULL CHECK(owner_kind IN ('chat','task')), owner_id TEXT NOT NULL, version INTEGER NOT NULL, grant_scope TEXT NOT NULL CHECK(grant_scope IN ('chat-once','chat-session','task')), effect_class TEXT NOT NULL CHECK(effect_class IN ('read','repository-write','ambient')), requested_scope_json TEXT NOT NULL, resource_snapshot_id TEXT, logical_scope TEXT NOT NULL, risk_summary TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('open','approved','denied','stale','cancelled')), decision TEXT CHECK(decision IN ('approved','denied')), confirmation_hash TEXT, created_at TEXT NOT NULL, resolved_at TEXT); CREATE TABLE IF NOT EXISTS authority_grants (grant_id TEXT PRIMARY KEY, review_id TEXT NOT NULL REFERENCES authority_reviews(review_id) ON DELETE RESTRICT, scope_json TEXT NOT NULL, effect_class TEXT NOT NULL CHECK(effect_class IN ('read','repository-write','ambient')), owner_kind TEXT NOT NULL CHECK(owner_kind IN ('chat','task')), owner_id TEXT NOT NULL, resource_snapshot_id TEXT, fingerprint TEXT NOT NULL, issued_at TEXT NOT NULL, expires_at TEXT, revoked_at TEXT, consumed_at TEXT);");
+    this.db.exec("CREATE TABLE IF NOT EXISTS durable_operations (operation_id TEXT PRIMARY KEY, version INTEGER NOT NULL, operation_key TEXT NOT NULL UNIQUE, parent_kind TEXT NOT NULL CHECK(parent_kind IN ('response-attempt','assignment-attempt')), parent_id TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('intent-recorded','executing','retry-wait','reconciling','outcome-unknown','succeeded','failed','cancelled')), effect_class TEXT NOT NULL CHECK(effect_class IN ('read','repository-write','ambient')), intent_fingerprint TEXT NOT NULL, authority_grant_id TEXT REFERENCES authority_grants(grant_id) ON DELETE RESTRICT, resource_snapshot_id TEXT REFERENCES resource_snapshots(snapshot_id) ON DELETE RESTRICT, target_fingerprint TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, terminal_at TEXT); CREATE TABLE IF NOT EXISTS operation_execution_attempts (operation_id TEXT NOT NULL REFERENCES durable_operations(operation_id) ON DELETE RESTRICT, ordinal INTEGER NOT NULL CHECK(ordinal >= 1), state TEXT NOT NULL CHECK(state IN ('executing','known-applied','known-not-applied','failed','cancelled','interrupted')), handoff_started_at TEXT NOT NULL, finished_at TEXT, sanitized_outcome_code TEXT, PRIMARY KEY(operation_id, ordinal)); CREATE TABLE IF NOT EXISTS operation_barriers (barrier_id TEXT PRIMARY KEY, operation_id TEXT NOT NULL UNIQUE REFERENCES durable_operations(operation_id) ON DELETE RESTRICT, scope_kind TEXT NOT NULL CHECK(scope_kind IN ('workspace-mutation','external-target')), scope_fingerprint TEXT NOT NULL, created_at TEXT NOT NULL, removed_at TEXT, removal_reason TEXT); CREATE TABLE IF NOT EXISTS reconciliation_evidence (evidence_id TEXT PRIMARY KEY, operation_id TEXT NOT NULL REFERENCES durable_operations(operation_id) ON DELETE RESTRICT, ordinal INTEGER NOT NULL, classification TEXT NOT NULL CHECK(classification IN ('applied','not-applied','inconclusive')), observed_at TEXT NOT NULL, UNIQUE(operation_id, ordinal)); CREATE TABLE IF NOT EXISTS tool_audit_records (audit_id TEXT PRIMARY KEY, operation_id TEXT NOT NULL REFERENCES durable_operations(operation_id) ON DELETE RESTRICT, ordinal INTEGER NOT NULL, tool_identity TEXT NOT NULL, effect_class TEXT NOT NULL CHECK(effect_class IN ('read','repository-write','ambient')), authority_review_id TEXT REFERENCES authority_reviews(review_id) ON DELETE RESTRICT, decision_code TEXT NOT NULL CHECK(decision_code IN ('allowed','denied')), input_fingerprint TEXT NOT NULL, sanitized_input_json TEXT NOT NULL, sanitized_result_json TEXT, affected_targets_json TEXT NOT NULL, started_at TEXT, terminal_at TEXT, outcome_code TEXT CHECK(outcome_code IN ('applied','not-applied','failed','denied','interrupted','unknown')), UNIQUE(operation_id, ordinal)); CREATE TABLE IF NOT EXISTS tool_audit_corrections (correction_id TEXT PRIMARY KEY, audit_id TEXT NOT NULL REFERENCES tool_audit_records(audit_id) ON DELETE RESTRICT, ordinal INTEGER NOT NULL, reason_code TEXT NOT NULL, sanitized_delta_json TEXT NOT NULL, created_at TEXT NOT NULL, UNIQUE(audit_id, ordinal));");
+    this.db.exec("DROP TRIGGER IF EXISTS tool_audit_immutable_fields; CREATE TRIGGER IF NOT EXISTS tool_audit_no_delete BEFORE DELETE ON tool_audit_records BEGIN SELECT RAISE(ABORT, 'tool-audit-append-only'); END; CREATE TRIGGER IF NOT EXISTS tool_audit_correction_no_update BEFORE UPDATE ON tool_audit_corrections BEGIN SELECT RAISE(ABORT, 'tool-audit-correction-append-only'); END; CREATE TRIGGER IF NOT EXISTS tool_audit_correction_no_delete BEFORE DELETE ON tool_audit_corrections BEGIN SELECT RAISE(ABORT, 'tool-audit-correction-append-only'); END; CREATE TRIGGER IF NOT EXISTS reconciliation_evidence_no_update BEFORE UPDATE ON reconciliation_evidence BEGIN SELECT RAISE(ABORT, 'reconciliation-evidence-append-only'); END; CREATE TRIGGER IF NOT EXISTS reconciliation_evidence_no_delete BEFORE DELETE ON reconciliation_evidence BEGIN SELECT RAISE(ABORT, 'reconciliation-evidence-append-only'); END; CREATE TRIGGER tool_audit_immutable_fields BEFORE UPDATE ON tool_audit_records WHEN OLD.audit_id <> NEW.audit_id OR OLD.operation_id <> NEW.operation_id OR OLD.ordinal <> NEW.ordinal OR OLD.tool_identity <> NEW.tool_identity OR OLD.effect_class <> NEW.effect_class OR OLD.decision_code <> NEW.decision_code OR OLD.input_fingerprint <> NEW.input_fingerprint OR OLD.sanitized_input_json <> NEW.sanitized_input_json OR OLD.authority_review_id IS NOT NEW.authority_review_id OR OLD.outcome_code IS NOT NULL OR (OLD.started_at IS NOT NULL AND NEW.started_at IS NOT OLD.started_at) OR (OLD.terminal_at IS NOT NULL AND NEW.terminal_at IS NOT OLD.terminal_at) OR (OLD.sanitized_result_json IS NOT NULL AND NEW.sanitized_result_json IS NOT OLD.sanitized_result_json) OR (NEW.outcome_code IS NULL AND (NEW.terminal_at IS NOT OLD.terminal_at OR NEW.sanitized_result_json IS NOT OLD.sanitized_result_json)) OR (NEW.outcome_code IS NOT NULL AND NEW.terminal_at IS NULL) BEGIN SELECT RAISE(ABORT, 'tool-audit-immutable'); END;");
     this.addColumn("chat_sessions", "title", "TEXT NOT NULL DEFAULT 'New chat'");
     this.addColumn("chat_sessions", "origin_chat_id", "TEXT");
     this.addColumn("chat_sessions", "trashed_at", "TEXT");
     this.addColumn("response_attempts", "effective_model_id", "TEXT");
     this.addColumn("response_attempts", "snapshot_id", "TEXT");
     this.addColumn("response_attempts", "ended_at", "TEXT");
-    this.db.exec("CREATE UNIQUE INDEX IF NOT EXISTS resource_snapshots_attempt_unique ON resource_snapshots(attempt_id); CREATE UNIQUE INDEX IF NOT EXISTS authority_reviews_open_scope_unique ON authority_reviews(owner_kind, owner_id, logical_scope) WHERE status = 'open'");
+    this.db.exec("CREATE UNIQUE INDEX IF NOT EXISTS resource_snapshots_attempt_unique ON resource_snapshots(attempt_id); CREATE UNIQUE INDEX IF NOT EXISTS authority_reviews_open_scope_unique ON authority_reviews(owner_kind, owner_id, logical_scope) WHERE status = 'open'; CREATE INDEX IF NOT EXISTS durable_operations_parent ON durable_operations(parent_kind, parent_id); CREATE INDEX IF NOT EXISTS durable_operations_recovery ON durable_operations(state) WHERE state IN ('executing','reconciling','outcome-unknown')");
   }
   private addColumn(table: string, column: string, type: string): void { try { this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`); } catch { /* Existing databases already have the column. */ } }
 }
@@ -302,4 +487,81 @@ function mapAuthorityGrant(row: AuthorityGrantRow): AuthorityGrant {
     revokedAt: row.revokedAt,
     consumedAt: row.consumedAt,
   };
+}
+
+interface ToolAuditRow {
+  readonly auditId: string;
+  readonly operationId: string;
+  readonly ordinal: number;
+  readonly toolIdentity: string;
+  readonly effectClass: ToolAuditRecord["effectClass"];
+  readonly authorityReviewId: string | null;
+  readonly decisionCode: ToolAuditRecord["decisionCode"];
+  readonly inputFingerprint: string;
+  readonly sanitizedInputJson: string;
+  readonly sanitizedResultJson: string | null;
+  readonly affectedTargetsJson: string;
+  readonly startedAt: string | null;
+  readonly terminalAt: string | null;
+  readonly outcomeCode: ToolOutcomeCode | null;
+}
+
+interface ToolAuditCorrectionRow {
+  readonly correctionId: string;
+  readonly auditId: string;
+  readonly ordinal: number;
+  readonly reasonCode: string;
+  readonly sanitizedDeltaJson: string;
+  readonly createdAt: string;
+}
+
+function mapToolAudit(row: ToolAuditRow): ToolAuditRecord {
+  return {
+    auditId: row.auditId,
+    operationId: row.operationId,
+    ordinal: row.ordinal,
+    toolIdentity: row.toolIdentity,
+    effectClass: row.effectClass,
+    authorityReviewId: row.authorityReviewId,
+    decisionCode: row.decisionCode,
+    inputFingerprint: row.inputFingerprint,
+    sanitizedInput: JSON.parse(row.sanitizedInputJson) as Readonly<Record<string, unknown>>,
+    sanitizedResult: row.sanitizedResultJson === null ? null : JSON.parse(row.sanitizedResultJson) as Readonly<Record<string, unknown>>,
+    affectedTargets: JSON.parse(row.affectedTargetsJson) as readonly string[],
+    startedAt: row.startedAt,
+    terminalAt: row.terminalAt,
+    outcomeCode: row.outcomeCode,
+  };
+}
+
+function validateHash(value: string, field: string): void {
+  if (!/^[a-f0-9]{64}$/.test(value)) throw new Error(`${field}-must-be-sha256`);
+}
+
+function boundedSanitizedRecord(value: Readonly<Record<string, unknown>>, field: string): Readonly<Record<string, unknown>> {
+  const sanitized = sanitize({ ...value });
+  let encoded: string;
+  try { encoded = JSON.stringify(sanitized); }
+  catch { throw new Error(`${field}-invalid-json`); }
+  if (Buffer.byteLength(encoded, "utf8") > 64 * 1024) throw new Error(`${field}-too-large`);
+  return JSON.parse(encoded) as Readonly<Record<string, unknown>>;
+}
+
+function boundedTargets(values: readonly string[]): readonly string[] {
+  if (values.length > 100) throw new Error("affected-targets-too-many");
+  const targets = [...new Set(values)].sort();
+  if (targets.some((target) => !/^(?:repo|endpoint|resource):[A-Za-z0-9._/-]{1,480}$/.test(target))) throw new Error("affected-target-invalid");
+  for (const target of targets.filter((value) => value.startsWith("repo:"))) {
+    const path = target.slice("repo:".length);
+    if (path.startsWith("/") || path.split("/").some((segment) => segment === "..")) throw new Error("affected-target-invalid");
+  }
+  return targets;
+}
+
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (typeof value === "object" && value !== null) {
+    return `{${Object.entries(value as Readonly<Record<string, unknown>>).sort(([left], [right]) => left.localeCompare(right)).map(([key, item]) => `${JSON.stringify(key)}:${canonicalJson(item)}`).join(",")}}`;
+  }
+  return JSON.stringify(value) ?? "null";
 }

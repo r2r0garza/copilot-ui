@@ -18,4 +18,5 @@ export interface ExecutionAuthorityService {
 
 export * from "./grants";
 export * from "./environment";
+export * from "./operations";
 export * from "./policy";
