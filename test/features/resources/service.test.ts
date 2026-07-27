@@ -78,7 +78,9 @@ test("refreshes host-registered Tools without changing their extension origin", 
   let tools: readonly ToolResource[] = [];
   const controller = new ResourceCatalogController(root, "fixture", undefined, () => tools);
 
-  assert.deepEqual(controller.getState().catalog.tools.map((tool) => tool.origin), ["workbench", "workbench", "workbench"]);
+  assert.deepEqual(controller.getState().catalog.tools.map((tool) => tool.origin), [
+    "workbench", "workbench", "workbench", "workbench", "workbench", "workbench",
+  ]);
   tools = [{
     identity: "extension/search",
     description: "Search through an extension.",

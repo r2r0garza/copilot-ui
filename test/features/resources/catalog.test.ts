@@ -20,7 +20,8 @@ test("discovers valid repository resources while isolating invalid peers", () =>
   assert.equal(catalog.mcpServers.find((server) => server.name === "local")?.status, "available");
   assert.equal(catalog.mcpServers.find((server) => server.name === "unsupported")?.status, "unavailable");
   assert.equal(catalog.diagnostics.find((item) => item.code === "resource.unknown-field")?.severity, "warning");
-  assert.deepEqual(catalog.tools.map((tool) => tool.identity), ["files/list", "files/read", "files/write"]);
+  assert.deepEqual(catalog.tools.map((tool) => tool.identity), ["files/list", "files/read", "files/write", "git/status", "git/stage", "git/commit"]);
+  assert.equal(catalog.tools.find((tool) => tool.identity === "git/status")?.status, "unavailable");
   assert.equal(loadSkillInstructions(root, "review"), "Read the selected diff.");
 });
 

@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { isAlias, isMap, isScalar, parseDocument, visit, type Node, type Pair } from "yaml";
 
 import { repositoryToolCatalog } from "../tools/repositoryTools";
+import { repositoryGitToolCatalog } from "../tools/gitTools";
 import { readMcpConfiguration, type McpTransport } from "./mcp";
 
 export type ResourceStatus = "available" | "unavailable" | "invalid";
@@ -114,7 +115,7 @@ export function discoverResources(root: string, additionalTools: readonly ToolRe
   const mcp = readMcpConfiguration(join(root, ".vscode", "mcp.json"));
   diagnostics.push(...mcp.diagnostics);
   const mcpServers = mcp.servers;
-  const tools = mergeToolCatalog([...repositoryToolCatalog, ...additionalTools], diagnostics);
+  const tools = mergeToolCatalog([...repositoryToolCatalog, ...repositoryGitToolCatalog(root), ...additionalTools], diagnostics);
   return { agents, skills, mcpServers, tools, diagnostics };
 }
 
